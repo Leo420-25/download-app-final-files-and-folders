@@ -1,0 +1,356 @@
+// aria2_client.dart
+//
+// Drop this file into lib/ alongside main.dart.
+//
+// Provides:
+//   - Aria2Daemon   : spawns and supervises the bundled aria2c.exe process
+//   - Aria2RpcClient: talks JSON-RPC to that process over HTTP
+//   - Aria2Status   : a typed view of aria2's tellStatus response
+//
+// Bundling aria2c.exe:
+//   1. Download a Windows build of aria2 (aria2c.exe) and place it at:
+//        windows/aria2/aria2c.exe
+//      (create the folder yourself)
+//   2. In windows/runner/CMakeLists.txt, add a step to copy it next to the
+//      built exe, e.g. inside the existing install()/add_custom_command
+//      section:
+//        add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+//          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+//            "${CMAKE_CURRENT_SOURCE_DIR}/../aria2/aria2c.exe"
+//            "$<TARGET_FILE_DIR:${BINARY_NAME}>/aria2c.exe")
+//      This keeps aria2c.exe sitting right next to your app's .exe in both
+//      debug and release builds, so Directory(Platform.resolvedExecutable)
+//      finds it in dev and after packaging.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'package:dio/dio.dart';
+import 'package:path/path.dart' as p;
+
+/// Thrown when aria2 returns a JSON-RPC error object.
+class Aria2RpcException implements Exception {
+  final int? code;
+  final String message;
+  Aria2RpcException(this.message, {this.code});
+  @override
+  String toString() => 'Aria2RpcException($code): $message';
+}
+
+/// Thrown when the daemon fails to start or become reachable.
+class Aria2DaemonException implements Exception {
+  final String message;
+  Aria2DaemonException(this.message);
+  @override
+  String toString() => 'Aria2DaemonException: $message';
+}
+
+/// A single file entry inside a download (torrent files map 1:1 to these).
+class Aria2FileInfo {
+  final int index; // 1-based, as aria2 reports it
+  final String path;
+  final int length;
+  final int completedLength;
+  final bool selected;
+
+  Aria2FileInfo({
+    required this.index,
+    required this.path,
+    required this.length,
+    required this.completedLength,
+    required this.selected,
+  });
+
+  double get progress => length > 0 ? (completedLength / length).clamp(0.0, 1.0) : 0.0;
+
+  factory Aria2FileInfo.fromJson(Map<String, dynamic> j, int index) {
+    return Aria2FileInfo(
+      index: index,
+      path: j['path'] as String? ?? '',
+      length: int.tryParse(j['length']?.toString() ?? '0') ?? 0,
+      completedLength: int.tryParse(j['completedLength']?.toString() ?? '0') ?? 0,
+      selected: (j['selected'] as String? ?? 'true') == 'true',
+    );
+  }
+}
+
+enum Aria2State { active, waiting, paused, error, complete, removed, unknown }
+
+Aria2State _parseState(String? s) {
+  switch (s) {
+    case 'active': return Aria2State.active;
+    case 'waiting': return Aria2State.waiting;
+    case 'paused': return Aria2State.paused;
+    case 'error': return Aria2State.error;
+    case 'complete': return Aria2State.complete;
+    case 'removed': return Aria2State.removed;
+    default: return Aria2State.unknown;
+  }
+}
+
+/// Typed view of aria2's tellStatus / tellActive / tellWaiting responses.
+class Aria2Status {
+  final String gid;
+  final Aria2State state;
+  final int totalLength;
+  final int completedLength;
+  final int downloadSpeed;
+  final int uploadSpeed;
+  final int numSeeders;
+  final int connections;
+  final String errorMessage;
+  final List<Aria2FileInfo> files;
+  final String? infoHashName; // bittorrent.info.name, when present
+
+  Aria2Status({
+    required this.gid,
+    required this.state,
+    required this.totalLength,
+    required this.completedLength,
+    required this.downloadSpeed,
+    required this.uploadSpeed,
+    required this.numSeeders,
+    required this.connections,
+    required this.errorMessage,
+    required this.files,
+    this.infoHashName,
+  });
+
+  double get progress => totalLength > 0 ? (completedLength / totalLength).clamp(0.0, 1.0) : 0.0;
+
+  factory Aria2Status.fromJson(Map<String, dynamic> j) {
+    final filesJson = (j['files'] as List<dynamic>? ?? const []);
+    final files = <Aria2FileInfo>[];
+    for (var i = 0; i < filesJson.length; i++) {
+      files.add(Aria2FileInfo.fromJson(filesJson[i] as Map<String, dynamic>, i + 1));
+    }
+    String? name;
+    final bt = j['bittorrent'] as Map<String, dynamic>?;
+    if (bt != null) {
+      final info = bt['info'] as Map<String, dynamic>?;
+      if (info != null) name = info['name'] as String?;
+    }
+    return Aria2Status(
+      gid: j['gid'] as String? ?? '',
+      state: _parseState(j['status'] as String?),
+      totalLength: int.tryParse(j['totalLength']?.toString() ?? '0') ?? 0,
+      completedLength: int.tryParse(j['completedLength']?.toString() ?? '0') ?? 0,
+      downloadSpeed: int.tryParse(j['downloadSpeed']?.toString() ?? '0') ?? 0,
+      uploadSpeed: int.tryParse(j['uploadSpeed']?.toString() ?? '0') ?? 0,
+      numSeeders: int.tryParse(j['numSeeders']?.toString() ?? '0') ?? 0,
+      connections: int.tryParse(j['connections']?.toString() ?? '0') ?? 0,
+      errorMessage: j['errorMessage'] as String? ?? '',
+      files: files,
+      infoHashName: name,
+    );
+  }
+}
+
+/// Spawns and supervises the bundled aria2c.exe (or aria2c on other
+/// platforms, if you bundle it there too).
+class Aria2Daemon {
+  Process? _process;
+  final int rpcPort;
+  final String rpcSecret;
+  final String downloadDirFallback;
+
+  Aria2Daemon({
+    this.rpcPort = 6801,
+    required this.rpcSecret,
+    required this.downloadDirFallback,
+  });
+
+  bool get isRunning => _process != null;
+
+  Future<String> _resolveExecutablePath() async {
+    // aria2c.exe is copied next to the app's own executable at build time
+    // (see the CMake snippet in the file header comment).
+    final exeDir = p.dirname(Platform.resolvedExecutable);
+    final candidate = p.join(exeDir, Platform.isWindows ? 'aria2c.exe' : 'aria2c');
+    if (await File(candidate).exists()) {
+      return candidate;
+    }
+    throw Aria2DaemonException(
+      'aria2c executable not found at $candidate. '
+      'Make sure it is bundled next to the app binary.',
+    );
+  }
+
+  /// Starts the daemon and waits until its RPC endpoint responds.
+  Future<void> start() async {
+    if (isRunning) return;
+
+    final exePath = await _resolveExecutablePath();
+    final sessionDir = Directory(p.join(downloadDirFallback, '.aria2_session'));
+    if (!await sessionDir.exists()) {
+      await sessionDir.create(recursive: true);
+    }
+    final sessionFile = p.join(sessionDir.path, 'aria2.session');
+    if (!await File(sessionFile).exists()) {
+      await File(sessionFile).create();
+    }
+
+    _process = await Process.start(
+      exePath,
+      [
+        '--enable-rpc=true',
+        '--rpc-listen-all=false', // localhost only
+        '--rpc-listen-port=$rpcPort',
+        '--rpc-secret=$rpcSecret',
+        '--continue=true', // resume partial files
+        '--max-connection-per-server=8',
+        '--split=8',
+        '--bt-enable-lpd=true',
+        '--enable-dht=true',
+        '--seed-time=0', // stop seeding immediately once a torrent completes
+        '--dir=$downloadDirFallback',
+        '--input-file=$sessionFile',
+        '--save-session=$sessionFile',
+        '--save-session-interval=30',
+        '--force-save=false',
+        '--quiet=true',
+        '--disable-ipv6=true',
+      ],
+      mode: ProcessStartMode.detachedWithStdio,
+    );
+
+    await _waitUntilReady();
+  }
+
+  Future<void> _waitUntilReady({int timeoutSeconds = 10}) async {
+    final client = Aria2RpcClient(port: rpcPort, secret: rpcSecret);
+    final deadline = DateTime.now().add(Duration(seconds: timeoutSeconds));
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        await client.getVersion();
+        return; // reachable
+      } catch (_) {
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
+    throw Aria2DaemonException('aria2 RPC did not become ready within ${timeoutSeconds}s.');
+  }
+
+  Future<void> stop() async {
+    if (_process == null) return;
+    try {
+      final client = Aria2RpcClient(port: rpcPort, secret: rpcSecret);
+      await client.shutdown();
+    } catch (_) {
+      // fall back to killing the process directly
+      _process?.kill(ProcessSignal.sigterm);
+    }
+    _process = null;
+  }
+}
+
+/// Minimal JSON-RPC client for aria2's HTTP RPC interface.
+class Aria2RpcClient {
+  final int port;
+  final String secret;
+  final Dio _dio;
+  final _rand = Random();
+
+  Aria2RpcClient({required this.port, required this.secret})
+      : _dio = Dio(BaseOptions(
+          baseUrl: 'http://127.0.0.1:$port/jsonrpc',
+          connectTimeout: const Duration(seconds: 5),
+          receiveTimeout: const Duration(seconds: 10),
+          contentType: 'application/json',
+        ));
+
+  String _nextId() => 'dl_${DateTime.now().microsecondsSinceEpoch}_${_rand.nextInt(9999)}';
+
+  Future<dynamic> _call(String method, [List<dynamic> params = const []]) async {
+    final id = _nextId();
+    final body = {
+      'jsonrpc': '2.0',
+      'id': id,
+      'method': method,
+      'params': ['token:$secret', ...params],
+    };
+    late Response response;
+    try {
+      response = await _dio.post('', data: jsonEncode(body));
+    } on DioException catch (e) {
+      throw Aria2RpcException('RPC transport error calling $method: ${e.message}');
+    }
+    final data = response.data is String ? jsonDecode(response.data as String) : response.data;
+    if (data is Map<String, dynamic> && data.containsKey('error')) {
+      final err = data['error'] as Map<String, dynamic>;
+      throw Aria2RpcException(err['message'] as String? ?? 'Unknown aria2 error', code: err['code'] as int?);
+    }
+    return data['result'];
+  }
+
+  Future<String> getVersion() async {
+    final result = await _call('aria2.getVersion');
+    return result['version'] as String;
+  }
+
+  /// Adds a magnet link or a direct HTTP(S)/FTP URI. Returns the GID used
+  /// to track this download afterwards.
+  Future<String> addUri(String uri, {String? saveDirectory, String? fileName}) async {
+    final options = <String, dynamic>{};
+    if (saveDirectory != null) options['dir'] = saveDirectory;
+    if (fileName != null) options['out'] = fileName;
+    final result = await _call('aria2.addUri', [
+      [uri],
+      options,
+    ]);
+    return result as String;
+  }
+
+  /// Adds a .torrent file. [torrentBytes] is the raw file content.
+  Future<String> addTorrent(List<int> torrentBytes, {String? saveDirectory}) async {
+    final b64 = base64Encode(torrentBytes);
+    final options = <String, dynamic>{};
+    if (saveDirectory != null) options['dir'] = saveDirectory;
+    final result = await _call('aria2.addTorrent', [b64, <String>[], options]);
+    return result as String;
+  }
+
+  /// Restricts which files inside a multi-file torrent actually download.
+  /// [selectedIndices] are 1-based file indices, matching Aria2FileInfo.index.
+  /// Must be called before the torrent's metadata download completes for a
+  /// magnet, or immediately after adding for a .torrent file — call it
+  /// right after addTorrent/addUri and again once you see the file list
+  /// populate (magnets need metadata from peers before files are known).
+  Future<void> selectFiles(String gid, List<int> selectedIndices) async {
+    await _call('aria2.changeOption', [
+      gid,
+      {'select-file': selectedIndices.join(',')},
+    ]);
+  }
+
+  Future<Aria2Status> tellStatus(String gid) async {
+    final result = await _call('aria2.tellStatus', [gid]);
+    return Aria2Status.fromJson(result as Map<String, dynamic>);
+  }
+
+  Future<List<Aria2FileInfo>> getFiles(String gid) async {
+    final result = await _call('aria2.getFiles', [gid]) as List<dynamic>;
+    final files = <Aria2FileInfo>[];
+    for (var i = 0; i < result.length; i++) {
+      files.add(Aria2FileInfo.fromJson(result[i] as Map<String, dynamic>, i + 1));
+    }
+    return files;
+  }
+
+  Future<void> pause(String gid) => _call('aria2.pause', [gid]);
+  Future<void> unpause(String gid) => _call('aria2.unpause', [gid]);
+  Future<void> remove(String gid) => _call('aria2.remove', [gid]);
+  Future<void> forceRemove(String gid) => _call('aria2.forceRemove', [gid]);
+
+  /// Cleans up a completed/error/removed download's bookkeeping entry.
+  /// aria2 keeps finished downloads in memory until you purge them.
+  Future<void> removeDownloadResult(String gid) => _call('aria2.removeDownloadResult', [gid]);
+
+  Future<Map<String, dynamic>> getGlobalStat() async {
+    final result = await _call('aria2.getGlobalStat');
+    return result as Map<String, dynamic>;
+  }
+
+  Future<void> shutdown() => _call('aria2.shutdown');
+}
