@@ -16,13 +16,16 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:crypto/crypto.dart';
 
-// ANDROID BACKGROUND & PERMISSIONS
+// NEW IMPORTS FOR BACKGROUND & PERMISSIONS
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 // --- ARIA2 INTEGRATION ---
 import 'aria2_client.dart';
+
+// --- HANDOFF INTEGRATION ---
+import 'handoff_ui.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,13 +35,14 @@ Future<void> main() async {
     databaseFactory = databaseFactoryFfi;
   }
 
-  // Foreground Task & Permission Guards (Android only)
+  // NEW: Foreground Task & Permission Guards
   await ensureStoragePermissions();
   await checkNotificationPermissions();
   await initForegroundTask();
 
   await NotificationService.init();
   await downloadManager.init();
+  await HandoffController.instance.init();
 
   runApp(const DownloadManagerApp());
 }
@@ -51,7 +55,8 @@ Future<bool> ensureStoragePermissions() async {
   if (!Platform.isAndroid) return true;
 
   final androidInfo = await DeviceInfoPlugin().androidInfo;
-  
+
+  // API 28 is Android 9 (Pie). Only API <= 28 requires WRITE_EXTERNAL_STORAGE.
   if (androidInfo.version.sdkInt <= 28) {
     final status = await Permission.storage.status;
     if (!status.isGranted) {
@@ -61,6 +66,24 @@ Future<bool> ensureStoragePermissions() async {
   }
 
   return true;
+}
+
+Future<Directory> getDefaultDownloadDir() async {
+  if (Platform.isAndroid) {
+    try {
+      final extDir = await getExternalStorageDirectory();
+      if (extDir != null) {
+        final downloadDir = Directory(p.join(extDir.path, 'Download'));
+        if (!downloadDir.existsSync()) {
+          downloadDir.createSync(recursive: true);
+        }
+        return downloadDir;
+      }
+    } catch (e) {
+      debugPrint('getExternalStorageDirectory failed, falling back: $e');
+    }
+  }
+  return (await getDownloadsDirectory()) ?? await getApplicationDocumentsDirectory();
 }
 
 Future<void> checkNotificationPermissions() async {
@@ -152,7 +175,7 @@ class SafeDenseContainer extends StatelessWidget {
   const SafeDenseContainer({
     super.key,
     required this.child,
-    this.maxScale = 1.25, 
+    this.maxScale = 1.25,
   });
 
   @override
@@ -194,15 +217,25 @@ class NotificationService {
     await _plugin.initialize(settings: initSettings);
   }
 
-  static Future<void> show(int id, String title, String body) async {
-    const androidDetails = AndroidNotificationDetails('download_channel', 'Downloads', importance: Importance.max, priority: Priority.high);
-    const details = NotificationDetails(
+  static Future<void> show(int id, String title, String body, {bool isLowPriority = false}) async {
+    final androidDetails = AndroidNotificationDetails(
+      'download_channel',
+      'Downloads',
+      importance: isLowPriority ? Importance.low : Importance.max,
+      priority: isLowPriority ? Priority.low : Priority.high,
+    );
+    final details = NotificationDetails(
       android: androidDetails,
-      macOS: DarwinNotificationDetails(),
-      linux: LinuxNotificationDetails(),
+      macOS: const DarwinNotificationDetails(),
+      linux: const LinuxNotificationDetails(),
     );
 
-    await _plugin.show(id: id, title: title, body: body, notificationDetails: details);
+    await _plugin.show(
+      id: id,
+      title: title,
+      body: body,
+      notificationDetails: details,
+    );
   }
 }
 
@@ -229,25 +262,10 @@ class TorrentEngine {
   Future<void> init(String defaultDownloadDir) async {
     if (isLoaded) return;
 
-    // Direct process spawning for aria2 is only applicable to desktop
-    if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) {
-      return;
-    }
-
     if (Platform.isWindows) {
       try {
         await Process.run('taskkill', ['/F', '/IM', 'aria2c.exe']);
         await Future.delayed(const Duration(milliseconds: 500));
-      } catch (_) {}
-
-      // Auto-extract aria2c.exe next to executable if missing
-      try {
-        final exeDir = File(Platform.resolvedExecutable).parent.path;
-        final aria2File = File(p.join(exeDir, 'aria2c.exe'));
-        if (!aria2File.existsSync()) {
-          final byteData = await rootBundle.load('assets/aria2c.exe');
-          await aria2File.writeAsBytes(byteData.buffer.asUint8List(), flush: true);
-        }
       } catch (_) {}
     }
 
@@ -280,6 +298,18 @@ class TorrentEngine {
   Future<void> shutdown() async {
     await _daemon?.stop();
     isLoaded = false;
+  }
+
+  void safePause(String gid) {
+    try { client.pause(gid).catchError((_) {}); } catch (_) {}
+  }
+
+  void safeForceRemove(String gid) {
+    try { client.forceRemove(gid).catchError((_) {}); } catch (_) {}
+  }
+
+  void safeRemoveDownloadResult(String gid) {
+    try { client.removeDownloadResult(gid).catchError((_) {}); } catch (_) {}
   }
 }
 
@@ -327,8 +357,11 @@ class DownloadSegment {
 }
 
 class DownloadTask extends ChangeNotifier {
+  static int _notificationIdCounter = 1000;
+  final int notificationId = _notificationIdCounter++;
+
   final String id;
-  final String url;
+  String url;
   String fileName;
   String saveDirectory;
   int totalBytes;
@@ -363,6 +396,9 @@ class DownloadTask extends ChangeNotifier {
   TimeOfDay? scheduleStartTime;
   TimeOfDay? scheduleStopTime;
 
+  Map<String, String> customHeaders;
+  String? referer;
+
   DownloadTask({
     required this.id,
     required this.url,
@@ -383,6 +419,8 @@ class DownloadTask extends ChangeNotifier {
     this.scheduleStartTime,
     this.scheduleStopTime,
     this.aria2Gid,
+    this.customHeaders = const {},
+    this.referer,
     int? createdAtMillis,
   }) : createdAtMillis = createdAtMillis ?? DateTime.now().millisecondsSinceEpoch;
 
@@ -400,6 +438,21 @@ class DownloadTask extends ChangeNotifier {
       segments = list.map((e) => DownloadSegment.fromJson(e as Map<String, dynamic>)).toList();
     } catch (_) {
       segments = [];
+    }
+  }
+
+  String get customHeadersJson => customHeaders.isEmpty ? '' : jsonEncode(customHeaders);
+
+  set customHeadersJson(String json) {
+    if (json.isEmpty) {
+      customHeaders = {};
+      return;
+    }
+    try {
+      final map = jsonDecode(json) as Map;
+      customHeaders = map.map((k, v) => MapEntry('$k', '$v'));
+    } catch (_) {
+      customHeaders = {};
     }
   }
 
@@ -425,6 +478,8 @@ class DownloadTask extends ChangeNotifier {
       'taskStartTime': scheduleStartTime != null ? '${scheduleStartTime!.hour}:${scheduleStartTime!.minute}' : null,
       'taskStopTime': scheduleStopTime != null ? '${scheduleStopTime!.hour}:${scheduleStopTime!.minute}' : null,
       'aria2Gid': aria2Gid,
+      'customHeadersJson': customHeadersJson,
+      'referer': referer,
     };
   }
 
@@ -454,8 +509,10 @@ class DownloadTask extends ChangeNotifier {
       scheduleStartTime: _parseTime(map['taskStartTime'] as String?),
       scheduleStopTime: _parseTime(map['taskStopTime'] as String?),
       aria2Gid: map['aria2Gid'] as String?,
+      referer: map['referer'] as String?,
     );
     task.segmentsJson = map['segmentsJson'] as String? ?? '';
+    task.customHeadersJson = map['customHeadersJson'] as String? ?? '';
     return task;
   }
 }
@@ -473,7 +530,7 @@ class DiskSpaceHelper {
         if (driveLetter.isEmpty) return null;
         final result = await Process.run('powershell', ['-NoProfile', '-Command', "(Get-PSDrive -Name '$driveLetter').Free"]);
         if (result.exitCode == 0) return int.tryParse((result.stdout as String).trim());
-      } else if (Platform.isLinux || Platform.isMacOS) {
+      } else {
         final result = await Process.run('df', ['-Pk', path]);
         if (result.exitCode == 0) {
           final lines = (result.stdout as String).trim().split('\n');
@@ -518,7 +575,7 @@ class DatabaseHelper {
     final docsDir = await getApplicationSupportDirectory();
     final dbPath = p.join(docsDir.path, 'smart_download_manager_v2.db');
     return openDatabase(
-      dbPath, version: 12, 
+      dbPath, version: 13,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE downloads (
@@ -530,7 +587,8 @@ class DatabaseHelper {
             hashAlgorithm TEXT NOT NULL DEFAULT 'SHA-256', hashVerified INTEGER,
             segmentsJson TEXT NOT NULL DEFAULT '',
             taskSchedulerEnabled INTEGER NOT NULL DEFAULT 0,
-            taskStartTime TEXT, taskStopTime TEXT, aria2Gid TEXT
+            taskStartTime TEXT, taskStopTime TEXT, aria2Gid TEXT,
+            customHeadersJson TEXT NOT NULL DEFAULT '', referer TEXT
           )
         ''');
         await db.execute('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
@@ -545,6 +603,8 @@ class DatabaseHelper {
           "ALTER TABLE downloads ADD COLUMN taskStartTime TEXT",
           "ALTER TABLE downloads ADD COLUMN taskStopTime TEXT",
           "ALTER TABLE downloads ADD COLUMN aria2Gid TEXT",
+          "ALTER TABLE downloads ADD COLUMN customHeadersJson TEXT NOT NULL DEFAULT ''",
+          "ALTER TABLE downloads ADD COLUMN referer TEXT",
         ]) {
           try { await db.execute(stmt); } catch (_) {}
         }
@@ -580,18 +640,38 @@ class DatabaseHelper {
     if (maps.isNotEmpty) return maps.first['value'] as String?;
     return null;
   }
+
+  /// Alias used by `HandoffPairing` in `handoff_pairing.dart`.
+  Future<String?> loadSetting(String key) => getSetting(key);
 }
 
 // ==========================================
 // 3. ENGINE CORE
 // ==========================================
 
+class _AsyncLock {
+  Future<void> _chain = Future.value();
+  Future<T> synchronized<T>(Future<T> Function() action) {
+    final completer = Completer<void>();
+    final previous = _chain;
+    _chain = completer.future;
+    return previous.then((_) async {
+      try {
+        return await action();
+      } finally {
+        completer.complete();
+      }
+    });
+  }
+}
+
 class DownloadManager extends ChangeNotifier {
+  // 🔥 FIXED: Lowered max connections back to 8 to avoid server disconnects
   final Dio _dio = Dio(BaseOptions(headers: {'User-Agent': kDefaultUserAgent}, followRedirects: true, maxRedirects: 5))
     ..httpClientAdapter = IOHttpClientAdapter(
       createHttpClient: () {
         final client = HttpClient();
-        client.maxConnectionsPerHost = 16; 
+        client.maxConnectionsPerHost = 8;
         return client;
       },
     );
@@ -621,18 +701,22 @@ class DownloadManager extends ChangeNotifier {
   StreamSubscription<dynamic>? _connectivitySub;
   final Set<String> _networkPausedTaskIds = {};
 
-  int globalSpeedLimitKbps = 0; 
+  int globalSpeedLimitKbps = 0;
   double _throttleTokens = 0;
   int _lastThrottleUpdate = DateTime.now().millisecondsSinceEpoch;
 
   final Map<String, int> _activeConnectionsPerHost = {};
+  // 🔥 FIXED: Lowered soft limit back to 8
   static const int _maxConnectionsPerHostSoft = 8;
 
   int segmentsPerDownload = 8;
-  static const int _minSegmentSizeBytes = 2 * 1024 * 1024; 
-  static const int _segmentedMinFileSize = 5 * 1024 * 1024; 
+  static const int _minSegmentSizeBytes = 2 * 1024 * 1024;
+  static const int _segmentedMinFileSize = 5 * 1024 * 1024;
 
   final Map<String, Timer> _progressTimers = {};
+  
+  final Map<String, RandomAccessFile> _segmentFileHandles = {};
+  final Map<String, _AsyncLock> _segmentFileLocks = {};
 
   bool isSchedulerEnabled = false;
   TimeOfDay? scheduleStartTime;
@@ -651,8 +735,8 @@ class DownloadManager extends ChangeNotifier {
     if (isInitialized) {
       return;
     }
-    
-    final defaultDir = (await getDownloadsDirectory()) ?? await getApplicationDocumentsDirectory();
+
+    final defaultDir = await getDefaultDownloadDir();
     try {
       await torrentEngine.init(defaultDir.path);
     } catch (e) {
@@ -673,7 +757,7 @@ class DownloadManager extends ChangeNotifier {
       activeTasks.add(task);
       await _dbHelper.upsertTask(task);
     }
-    
+
     final formatStr = await _dbHelper.getSetting('use_24_hour_format');
     use24HourFormat = formatStr == 'true';
 
@@ -685,7 +769,7 @@ class DownloadManager extends ChangeNotifier {
       final parts = startStr.split(':');
       scheduleStartTime = TimeOfDay(hour: int.parse(parts[0]), minute: int.parse(parts[1]));
     } else {
-      scheduleStartTime = const TimeOfDay(hour: 2, minute: 0); 
+      scheduleStartTime = const TimeOfDay(hour: 2, minute: 0);
     }
 
     final stopStr = await _dbHelper.getSetting('scheduler_stop');
@@ -693,11 +777,11 @@ class DownloadManager extends ChangeNotifier {
       final parts = stopStr.split(':');
       scheduleStopTime = TimeOfDay(hour: int.parse(parts[0]), minute: int.parse(parts[1]));
     } else {
-      scheduleStopTime = const TimeOfDay(hour: 7, minute: 0); 
+      scheduleStopTime = const TimeOfDay(hour: 7, minute: 0);
     }
 
     _scheduleNextSchedulerCheck();
-    
+
     _uiRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       for (final t in activeTasks) {
         if (t.status == DownloadStatus.waiting && !canTaskRun(t)) {
@@ -713,7 +797,7 @@ class DownloadManager extends ChangeNotifier {
       double currentDl = 0.0;
       double currentUl = 0.0;
       int activeCount = 0;
-      
+
       for (final t in activeTasks) {
         if ([DownloadStatus.downloading, DownloadStatus.connecting].contains(t.status)) {
           currentDl += t.speedBytesPerSecond;
@@ -721,22 +805,22 @@ class DownloadManager extends ChangeNotifier {
           activeCount++;
         }
       }
-      
+
       dailyDownloadedBytes += currentDl.toInt();
       dailyUploadedBytes += currentUl.toInt();
-      
+
       final currentTotal = currentDl + currentUl;
       if (currentTotal > peakSpeedBytesPerSecond) {
         peakSpeedBytesPerSecond = currentTotal;
       }
-      
+
       speedHistory.add(SpeedPoint(currentDl, currentUl));
       if (speedHistory.length > 60) {
-        speedHistory.removeAt(0); 
+        speedHistory.removeAt(0);
       }
-      
+
       activeTaskCount = activeCount;
-      notifyListeners(); 
+      notifyListeners();
     });
 
     isInitialized = true;
@@ -744,7 +828,54 @@ class DownloadManager extends ChangeNotifier {
     notifyListeners();
     _processQueue();
   }
-  
+
+  /// Integration point called by `HandoffController` when a link is sent from a phone.
+  Future<void> addDownload(
+    String url,
+    String fileName, {
+    Map<String, String>? headers,
+    String? referer,
+  }) async {
+    final cleanedUrl = cleanUrl(url);
+    final meta = await fetchFileMetadata(
+      cleanedUrl,
+      customHeaders: headers,
+      referer: referer,
+    );
+    final dir = await getDefaultDownloadDir();
+
+    String resolvedName = fileName.trim();
+    if (resolvedName.isEmpty ||
+        resolvedName == 'download' ||
+        resolvedName == 'downloaded_file') {
+      if (meta['success'] == true &&
+          (meta['fileName'] as String?)?.isNotEmpty == true) {
+        resolvedName = meta['fileName'] as String;
+      } else if (cleanedUrl.startsWith('magnet:?')) {
+        resolvedName = 'Torrent Download (Fetching metadata...)';
+      } else {
+        resolvedName = 'downloaded_file';
+      }
+    }
+
+    final totalBytes = meta['success'] == true ? (meta['totalBytes'] as int? ?? 0) : 0;
+    final supportsRange = meta['success'] == true ? (meta['supportsRange'] as bool? ?? false) : false;
+    final saveDir = meta['success'] == true ? (meta['saveDirectory'] as String? ?? dir.path) : dir.path;
+
+    final task = DownloadTask(
+      id: '${DateTime.now().millisecondsSinceEpoch}_${cleanedUrl.hashCode}',
+      url: meta['success'] == true ? (meta['cleanUrl'] as String? ?? cleanedUrl) : cleanedUrl,
+      fileName: resolvedName,
+      saveDirectory: saveDir,
+      totalBytes: totalBytes,
+      supportsRange: supportsRange,
+      customHeaders: headers ?? const {},
+      referer: referer,
+    );
+
+    enqueueDownload(task);
+  }
+
   bool get isInSchedulerWindow {
     if (scheduleStartTime == null || scheduleStopTime == null) {
       return true;
@@ -791,7 +922,7 @@ class DownloadManager extends ChangeNotifier {
     } else if (isSchedulerEnabled) {
       return checkWindow(scheduleStartTime, scheduleStopTime);
     }
-    return true; 
+    return true;
   }
 
   DateTime? _getNextBoundary() {
@@ -864,7 +995,7 @@ class DownloadManager extends ChangeNotifier {
     if (start == null) {
       return null;
     }
-    
+
     final now = DateTime.now();
     var next = DateTime(now.year, now.month, now.day, start.hour, start.minute);
     if (!next.isAfter(now)) {
@@ -877,7 +1008,7 @@ class DownloadManager extends ChangeNotifier {
     task.isSchedulerEnabled = enabled;
     task.scheduleStartTime = start;
     task.scheduleStopTime = stop;
-    
+
     if (enabled && task.status == DownloadStatus.paused) {
       task.status = DownloadStatus.waiting;
       if (queueSortStrategy != QueueSortStrategy.manual) {
@@ -919,16 +1050,16 @@ class DownloadManager extends ChangeNotifier {
     for (final t in activeTasks) {
       final allowed = canTaskRun(t);
       final isDownloading = [DownloadStatus.downloading, DownloadStatus.connecting].contains(t.status);
-      
+
       if (isDownloading && !allowed) {
         t.status = DownloadStatus.waiting;
         t.speedBytesPerSecond = 0;
         t.etaSeconds = 0;
         t.cancelToken?.cancel('Scheduler window closed');
         _cancelSegmentTokens(t, 'Scheduler window closed');
-        
+
         if (t.isTorrent && t.aria2Gid != null) {
-          torrentEngine.client.pause(t.aria2Gid!).catchError((_) {});
+          torrentEngine.safePause(t.aria2Gid!);
         }
 
         _progressTimers[t.id]?.cancel();
@@ -988,9 +1119,7 @@ class DownloadManager extends ChangeNotifier {
   }
 
   Future<void> _throttleBandwidth(int bytes) async {
-    if (globalSpeedLimitKbps <= 0) {
-      return;
-    }
+    if (globalSpeedLimitKbps <= 0) return;
     final limitBps = globalSpeedLimitKbps * 1024;
     final now = DateTime.now().millisecondsSinceEpoch;
     final elapsed = now - _lastThrottleUpdate;
@@ -1013,9 +1142,9 @@ class DownloadManager extends ChangeNotifier {
     if (host.isEmpty) return await action();
 
     while ((_activeConnectionsPerHost[host] ?? 0) >= _maxConnectionsPerHostSoft) {
-      await Future.delayed(const Duration(milliseconds: 200));
+      await Future.delayed(const Duration(milliseconds: 50));
     }
-    
+
     _activeConnectionsPerHost[host] = (_activeConnectionsPerHost[host] ?? 0) + 1;
     try {
       return await action();
@@ -1047,16 +1176,16 @@ class DownloadManager extends ChangeNotifier {
 
   void pauseSelected() {
     for (var id in selectedTaskIds) {
-       final t = activeTasks.firstWhere((task) => task.id == id);
-       pauseDownload(t);
+      final t = activeTasks.firstWhere((task) => task.id == id);
+      pauseDownload(t);
     }
     clearSelection();
   }
 
   void resumeSelected() {
     for (var id in selectedTaskIds) {
-       final t = activeTasks.firstWhere((task) => task.id == id);
-       enqueueDownload(t);
+      final t = activeTasks.firstWhere((task) => task.id == id);
+      enqueueDownload(t);
     }
     clearSelection();
   }
@@ -1086,9 +1215,7 @@ class DownloadManager extends ChangeNotifier {
       isOffline = _resultIsOffline(initial);
       _connectivitySub = connectivity.onConnectivityChanged.listen((result) {
         final offline = _resultIsOffline(result);
-        if (offline == isOffline) {
-          return;
-        }
+        if (offline == isOffline) return;
         isOffline = offline;
         if (isOffline) {
           _pauseAllForNetworkLoss();
@@ -1105,7 +1232,7 @@ class DownloadManager extends ChangeNotifier {
       if ([DownloadStatus.downloading, DownloadStatus.connecting].contains(t.status)) {
         _networkPausedTaskIds.add(t.id);
         if (t.isTorrent && t.aria2Gid != null) {
-          torrentEngine.client.pause(t.aria2Gid!).catchError((_) {});
+          torrentEngine.safePause(t.aria2Gid!);
         } else {
           t.cancelToken?.cancel('Network connection lost');
           _cancelSegmentTokens(t, 'Network connection lost');
@@ -1120,9 +1247,7 @@ class DownloadManager extends ChangeNotifier {
   }
 
   void _resumeNetworkPausedTasks() {
-    if (_networkPausedTaskIds.isEmpty) {
-      return;
-    }
+    if (_networkPausedTaskIds.isEmpty) return;
     final ids = List<String>.from(_networkPausedTaskIds);
     _networkPausedTaskIds.clear();
     for (final id in ids) {
@@ -1151,6 +1276,9 @@ class DownloadManager extends ChangeNotifier {
       timer.cancel();
     }
     _schedulerTimer?.cancel();
+    for (final raf in _segmentFileHandles.values) {
+      try { raf.close(); } catch (_) {}
+    }
     super.dispose();
   }
 
@@ -1279,11 +1407,15 @@ class DownloadManager extends ChangeNotifier {
     return trimmed;
   }
 
-  Future<Map<String, dynamic>> fetchFileMetadata(String rawUrl) async {
+  Future<Map<String, dynamic>> fetchFileMetadata(
+    String rawUrl, {
+    Map<String, String>? customHeaders,
+    String? referer,
+  }) async {
     final url = cleanUrl(rawUrl);
-    
+
     if (url.toLowerCase().endsWith('.torrent') && File(url).existsSync()) {
-      final dir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
+      final dir = await getDefaultDownloadDir();
       return {
         'success': true, 'cleanUrl': url, 'fileName': url.split(Platform.pathSeparator).last,
         'totalBytes': 0, 'saveDirectory': dir.path, 'supportsRange': false, 'isTorrent': true
@@ -1291,22 +1423,31 @@ class DownloadManager extends ChangeNotifier {
     }
 
     if (url.startsWith('magnet:?')) {
-       final dir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
-       return {
-         'success': true, 'cleanUrl': url, 'fileName': 'Torrent Download (Fetching metadata...)',
-         'totalBytes': 0, 'saveDirectory': dir.path, 'supportsRange': false, 'isTorrent': true
-       };
+      final dir = await getDefaultDownloadDir();
+      return {
+        'success': true, 'cleanUrl': url, 'fileName': 'Torrent Download (Fetching metadata...)',
+        'totalBytes': 0, 'saveDirectory': dir.path, 'supportsRange': false, 'isTorrent': true
+      };
     }
 
     try {
-      final options = Options(receiveTimeout: const Duration(seconds: 15), sendTimeout: const Duration(seconds: 15));
+      final reqHeaders = <String, dynamic>{
+        'User-Agent': kDefaultUserAgent,
+        if (customHeaders != null) ...customHeaders,
+        if (referer != null && referer.isNotEmpty) 'Referer': referer,
+      };
+      final options = Options(
+        receiveTimeout: const Duration(seconds: 15),
+        sendTimeout: const Duration(seconds: 15),
+        headers: reqHeaders,
+      );
       Response response;
       try {
         response = await _dio.head(url, options: options);
       } catch (_) {
         await Future.delayed(const Duration(milliseconds: 300));
         try {
-          response = await _dio.get(url, options: options.copyWith(headers: {'range': 'bytes=0-0'}));
+          response = await _dio.get(url, options: options.copyWith(headers: {...reqHeaders, 'range': 'bytes=0-0'}));
         } catch (_) {
           await Future.delayed(const Duration(milliseconds: 300));
           final cancelToken = CancelToken();
@@ -1320,20 +1461,25 @@ class DownloadManager extends ChangeNotifier {
       if (contentRange != null && contentRange.contains('/')) {
         totalBytes = int.tryParse(contentRange.split('/').last) ?? totalBytes;
       }
+
       String fileName = 'downloaded_file';
       final contentDisposition = response.headers.value('content-disposition');
-      if (contentDisposition != null && contentDisposition.contains('filename=')) {
-        fileName = contentDisposition.split('filename=').last.replaceAll('"', '');
+      if (contentDisposition != null) {
+        final starMatch = RegExp(r"filename\*\s*=\s*[^']*''([^;]+)", caseSensitive: false).firstMatch(contentDisposition);
+        final plainMatch = RegExp(r'filename\s*=\s*"?([^";]+)"?', caseSensitive: false).firstMatch(contentDisposition);
+        if (starMatch != null) {
+          fileName = Uri.decodeComponent(starMatch.group(1)!.trim());
+        } else if (plainMatch != null) {
+          fileName = plainMatch.group(1)!.trim();
+        }
       } else {
         final uri = Uri.tryParse(url);
-        if (uri != null && uri.pathSegments.isNotEmpty) {
-          fileName = uri.pathSegments.last;
-        }
+        if (uri != null && uri.pathSegments.isNotEmpty) fileName = uri.pathSegments.last;
       }
-      
+
       fileName = Uri.decodeComponent(fileName).replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
-      fileName = fileName.replaceAll(RegExp(r'[\s.]+$'), ''); 
-      
+      fileName = fileName.replaceAll(RegExp(r'[\s.]+$'), '');
+
       if (fileName.length > 200) {
         final extIndex = fileName.lastIndexOf('.');
         if (extIndex != -1 && fileName.length - extIndex < 20) {
@@ -1342,7 +1488,7 @@ class DownloadManager extends ChangeNotifier {
           fileName = fileName.substring(0, 200);
         }
       }
-      
+
       final baseName = fileName.split('.').first.toUpperCase();
       const reserved = ['CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'];
       if (reserved.contains(baseName)) {
@@ -1352,8 +1498,8 @@ class DownloadManager extends ChangeNotifier {
 
       final acceptRanges = response.headers.value('accept-ranges');
       final supportsRange = (acceptRanges != null && acceptRanges != 'none') || contentRange != null;
-      final dir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
-      
+      final dir = await getDefaultDownloadDir();
+
       bool isTorrent = url.endsWith('.torrent');
 
       return {
@@ -1369,8 +1515,8 @@ class DownloadManager extends ChangeNotifier {
   }
 
   String _getUniqueFileName(String directory, String originalName) {
-    if (originalName.contains('Fetching metadata')) return originalName; 
-    
+    if (originalName.contains('Fetching metadata')) return originalName;
+
     String name = originalName;
     String extension = '';
     int dotIndex = originalName.lastIndexOf('.');
@@ -1391,7 +1537,7 @@ class DownloadManager extends ChangeNotifier {
     final cleanedUrl = cleanUrl(url);
     DownloadTask? activeMatch;
     DownloadTask? completedMatch;
-    
+
     for (final t in activeTasks) {
       if (t.url == cleanedUrl) {
         if (t.status == DownloadStatus.completed) {
@@ -1420,7 +1566,7 @@ class DownloadManager extends ChangeNotifier {
       activeTasks.insert(0, task);
     }
     task.status = DownloadStatus.paused;
-    
+
     if (task.isTorrent) {
       currentTab = MainTab.torrents;
     } else {
@@ -1474,9 +1620,9 @@ class DownloadManager extends ChangeNotifier {
     final active = activeTasks.where((t) => t.status == DownloadStatus.downloading && t.id != task.id).toList();
     if (active.length >= maxConcurrentDownloads && active.isNotEmpty) {
       final taskToPause = active.last;
-      
+
       if (taskToPause.isTorrent && taskToPause.aria2Gid != null) {
-        torrentEngine.client.pause(taskToPause.aria2Gid!).catchError((_) {});
+        torrentEngine.safePause(taskToPause.aria2Gid!);
       } else {
         taskToPause.cancelToken?.cancel('Paused to allow forced download');
         _cancelSegmentTokens(taskToPause, 'Paused to allow forced download');
@@ -1496,23 +1642,15 @@ class DownloadManager extends ChangeNotifier {
   }
 
   void _processQueue() {
-    if (isOffline) {
-      return;
-    }
+    if (isOffline) return;
     final activeCount = activeTasks.where((t) => [DownloadStatus.downloading, DownloadStatus.connecting].contains(t.status)).length;
     int availableSlots = maxConcurrentDownloads - activeCount;
-    if (availableSlots <= 0) {
-      return;
-    }
-    
+    if (availableSlots <= 0) return;
+
     final orderedWaiting = _sortedWaitingTasks();
     for (var task in orderedWaiting) {
-      if (availableSlots <= 0) {
-        break;
-      }
-      if (!canTaskRun(task)) {
-        continue; 
-      }
+      if (availableSlots <= 0) break;
+      if (!canTaskRun(task)) continue;
       _startDownloadInternal(task);
       availableSlots--;
     }
@@ -1521,18 +1659,14 @@ class DownloadManager extends ChangeNotifier {
   void _persistTask(DownloadTask task, {bool force = false}) {
     final now = DateTime.now().millisecondsSinceEpoch;
     final last = _lastDbWriteMillis[task.id] ?? 0;
-    if (!force && (now - last) < _dbWriteIntervalMillis) {
-      return;
-    }
+    if (!force && (now - last) < _dbWriteIntervalMillis) return;
     _lastDbWriteMillis[task.id] = now;
     _dbHelper.upsertTask(task);
   }
 
   void _cancelSegmentTokens(DownloadTask task, String reason) {
     final tokens = task.segmentCancelTokens;
-    if (tokens == null) {
-      return;
-    }
+    if (tokens == null) return;
     for (final ct in tokens) {
       if (!ct.isCancelled) {
         ct.cancel(reason);
@@ -1580,13 +1714,13 @@ class DownloadManager extends ChangeNotifier {
         task.totalBytes = status.totalLength;
         task.downloadedBytes = status.completedLength;
         task.speedBytesPerSecond = status.downloadSpeed.toDouble();
-        
+
         task.uploadSpeedBytesPerSecond = status.uploadSpeed.toDouble();
         task.peers = status.connections;
         task.seeds = status.numSeeders;
-        
-        task.pieces = 0; 
-        task.uploadedBytes = 0; 
+
+        task.pieces = 0;
+        task.uploadedBytes = 0;
 
         if (status.downloadSpeed > 0 && status.totalLength > 0) {
           task.etaSeconds = ((status.totalLength - status.completedLength) / status.downloadSpeed).round();
@@ -1616,7 +1750,7 @@ class DownloadManager extends ChangeNotifier {
             task.status = DownloadStatus.failed;
             task.errorMessage = status.errorMessage.isNotEmpty ? status.errorMessage : 'Torrent error.';
             task.speedBytesPerSecond = 0;
-            NotificationService.show(task.id.hashCode, 'Download Failed', '${task.fileName}: ${task.errorMessage}');
+            NotificationService.show(task.notificationId, 'Download Failed', '${task.fileName}: ${task.errorMessage}');
             break;
           case Aria2State.paused:
             timer.cancel();
@@ -1689,7 +1823,7 @@ class DownloadManager extends ChangeNotifier {
         task.status = DownloadStatus.failed;
         task.errorMessage = 'Insufficient disk space.';
         task.speedBytesPerSecond = 0;
-        NotificationService.show(task.id.hashCode, 'Download Failed', '${task.fileName} failed: Insufficient space');
+        NotificationService.show(task.notificationId, 'Download Failed', '${task.fileName} failed: Insufficient space');
         task.notifyUI();
         _persistTask(task, force: true);
         _processQueue();
@@ -1700,8 +1834,12 @@ class DownloadManager extends ChangeNotifier {
       await _startSegmentedDownload(task);
     } else {
       if (!task.supportsRange && task.downloadedBytes > 0) {
-        task.downloadedBytes = 0;
-        _cleanupPartialFile(task.fullPath);
+        task.status = DownloadStatus.paused;
+        task.errorMessage = 'Server does not support resuming. Link may be expired.';
+        task.notifyUI();
+        _persistTask(task, force: true);
+        _processQueue();
+        return;
       }
       await _startSingleStreamDownload(task);
     }
@@ -1751,7 +1889,7 @@ class DownloadManager extends ChangeNotifier {
       }
     }
 
-    NotificationService.show(task.id.hashCode, 'Download Complete', task.fileName);
+    NotificationService.show(task.notificationId, 'Download Complete', task.fileName);
     task.notifyUI();
     notifyListeners();
     _persistTask(task, force: true);
@@ -1763,30 +1901,62 @@ class DownloadManager extends ChangeNotifier {
     if (task.segments.isEmpty || currentPlanSize != task.totalBytes) {
       task.segments = _buildSegments(task);
     }
+    
     final file = File(task.fullPath);
-    try {
-      final needsAlloc = !file.existsSync() || (await file.length()) != task.totalBytes;
-      if (needsAlloc) {
-        final raf = await file.open(mode: FileMode.write);
-        if (task.totalBytes > 0) {
-          await raf.setPosition(task.totalBytes - 1);
-          await raf.writeByte(0);
-        }
-        await raf.close();
-        for (final seg in task.segments) {
-          seg.downloadedBytes = 0;
-          seg.lastError = null;
+    final onDiskLengthMatches = file.existsSync() && (await file.length()) == task.totalBytes;
+    final needsAlloc = !onDiskLengthMatches;
+    
+    RandomAccessFile? raf = _segmentFileHandles[task.id];
+    bool allocated = raf != null && !needsAlloc;
+    Object? allocError;
+    
+    if (needsAlloc) {
+      if (raf != null) {
+        try { await raf.close(); } catch (_) {}
+        _segmentFileHandles.remove(task.id);
+        raf = null;
+      }
+      for (int attempt = 0; attempt < 3 && !allocated; attempt++) {
+        try {
+          final newRaf = await file.open(mode: FileMode.write);
+          if (task.totalBytes > 0) {
+            await newRaf.setPosition(task.totalBytes - 1);
+            await newRaf.writeByte(0);
+          }
+          for (final seg in task.segments) {
+            seg.downloadedBytes = 0;
+            seg.lastError = null;
+          }
+          raf = newRaf;
+          allocated = true;
+        } catch (e, st) {
+          allocError = e;
+          debugPrint('Segmented alloc attempt ${attempt + 1} failed for ${task.fullPath}: $e\n$st');
+          if (attempt < 2) await Future.delayed(Duration(seconds: (attempt + 1) * 2));
         }
       }
-    } catch (_) {
+    } else if (raf == null) {
+      try {
+        raf = await file.open(mode: FileMode.append);
+        allocated = true;
+      } catch (e) {
+        allocError = e;
+      }
+    }
+    
+    if (!allocated || raf == null) {
       task.status = DownloadStatus.failed;
-      task.errorMessage = 'Could not allocate file on disk.';
+      task.errorMessage = 'Could not allocate file on disk: $allocError';
       task.speedBytesPerSecond = 0;
       task.notifyUI();
       _persistTask(task, force: true);
       _processQueue();
       return;
     }
+    
+    _segmentFileHandles[task.id] = raf;
+    final lock = _segmentFileLocks.putIfAbsent(task.id, () => _AsyncLock());
+    
     task.status = DownloadStatus.downloading;
     task.segmentCancelTokens = [];
     task.notifyUI();
@@ -1797,7 +1967,7 @@ class DownloadManager extends ChangeNotifier {
     final Map<int, int> lastSegmentBytes = {
       for (final seg in task.segments) seg.index: seg.downloadedBytes,
     };
-    
+
     _progressTimers[task.id]?.cancel();
     _progressTimers[task.id] = Timer.periodic(const Duration(milliseconds: 500), (timer) {
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -1831,9 +2001,10 @@ class DownloadManager extends ChangeNotifier {
     final futures = <Future<void>>[];
     for (final segment in task.segments) {
       if (!segment.isComplete) {
-        futures.add(_downloadSegment(task, segment));
+        futures.add(_downloadSegment(task, segment, raf, lock));
       }
     }
+    
     try {
       await Future.wait(futures);
     } catch (_) {}
@@ -1852,80 +2023,155 @@ class DownloadManager extends ChangeNotifier {
       task.status = DownloadStatus.failed;
       task.errorMessage = failedSegment.first.lastError ?? 'One or more segments failed.';
       task.speedBytesPerSecond = 0;
-      NotificationService.show(task.id.hashCode, 'Download Failed', '${task.fileName}: ${task.errorMessage}');
+      NotificationService.show(task.notificationId, 'Download Failed', '${task.fileName}: ${task.errorMessage}');
       task.notifyUI();
       _persistTask(task, force: true);
+      await _closeSegmentHandle(task.id);
       _processQueue();
       return;
     }
 
     task.downloadedBytes = task.totalBytes;
+    await _closeSegmentHandle(task.id);
     await _finalizeTask(task);
   }
 
-  Future<void> _downloadSegment(DownloadTask task, DownloadSegment segment) async {
-    final absoluteStart = segment.startByte + segment.downloadedBytes;
-    if (absoluteStart > segment.endByte) {
-      return; 
+  Future<void> _closeSegmentHandle(String taskId) async {
+    final raf = _segmentFileHandles.remove(taskId);
+    _segmentFileLocks.remove(taskId);
+    if (raf != null) {
+      try { await raf.close(); } catch (_) {}
     }
+  }
+
+  // 🔥 ULTRA HIGH-SPEED SEGMENT DOWNLOADER WITH 1MB RAM BUFFER & ZERO-CONTENTION LOCKS 🔥
+  Future<void> _downloadSegment(DownloadTask task, DownloadSegment segment, RandomAccessFile raf, _AsyncLock lock) async {
+    final absoluteStart = segment.startByte + segment.downloadedBytes;
+    if (absoluteStart > segment.endByte) return;
+    
     final cancelToken = CancelToken();
     task.segmentCancelTokens?.add(cancelToken);
     final targetUrl = task.url;
+    
     try {
+      final reqHeaders = <String, dynamic>{
+        'User-Agent': kDefaultUserAgent,
+        ...task.customHeaders,
+        if (task.referer != null && task.referer!.isNotEmpty) 'Referer': task.referer,
+        'range': 'bytes=$absoluteStart-${segment.endByte}',
+      };
       final response = await _withHostLimit(targetUrl, () => _dio.get<ResponseBody>(
         targetUrl,
         cancelToken: cancelToken,
         options: Options(
           responseType: ResponseType.stream,
           receiveTimeout: const Duration(seconds: 30),
-          headers: {
-            'User-Agent': kDefaultUserAgent,
-            'range': 'bytes=$absoluteStart-${segment.endByte}',
-          },
+          headers: reqHeaders,
         ),
       ));
+
+      // Strictly enforce partial response
+      if (response.statusCode != 206) {
+        throw DioException(
+          requestOptions: response.requestOptions,
+          type: DioExceptionType.badResponse,
+          message: 'Server rejected partial download (Status: ${response.statusCode})',
+        );
+      }
 
       if (task.errorMessage.startsWith('🔄')) {
         task.errorMessage = '';
         task.notifyUI();
       }
 
-      final raf = await File(task.fullPath).open(mode: FileMode.append);
-      try {
-        await raf.setPosition(absoluteStart);
-        await for (final chunk in response.data!.stream) {
-          await _throttleBandwidth(chunk.length);
-          await raf.writeFrom(chunk);
-          segment.downloadedBytes += chunk.length;
+      int position = absoluteStart;
+      int bytesRemaining = (segment.endByte - absoluteStart) + 1;
+
+      // 🔥 FIX 1: copy: true prevents Dart from overwriting the socket buffers in RAM
+      final buffer = BytesBuilder(copy: true);
+      const int maxBufferSize = 1024 * 1024; // 1 MB chunk buffer
+
+      await for (final chunk in response.data!.stream) {
+        if (bytesRemaining <= 0) break;
+
+        List<int> bytesToWrite = chunk;
+        if (chunk.length > bytesRemaining) {
+          bytesToWrite = chunk.sublist(0, bytesRemaining);
         }
-      } finally {
-        await raf.close();
+
+        // Only incur async overhead if throttle limit is actively set
+        if (globalSpeedLimitKbps > 0) {
+          await _throttleBandwidth(bytesToWrite.length);
+        }
+
+        buffer.add(bytesToWrite);
+        bytesRemaining -= bytesToWrite.length;
+
+        // Flush directly to disk in fast atomic blocks
+        if (buffer.length >= maxBufferSize || bytesRemaining <= 0) {
+          final dataToWrite = buffer.takeBytes();
+          final writePosition = position; // 🔥 FIX: position already holds the correct start offset
+
+          await lock.synchronized(() async {
+            await raf.setPosition(writePosition);
+            await raf.writeFrom(dataToWrite); // 🔥 FIX: Async write to prevent UI block
+          });
+
+          position += dataToWrite.length;
+          segment.downloadedBytes += dataToWrite.length;
+        }
       }
+      
+      // 🔥 FIX 2: Catch silent CDN disconnects and force a retry
+      if (bytesRemaining > 0) {
+        throw DioException(
+          requestOptions: response.requestOptions,
+          type: DioExceptionType.connectionError,
+          message: 'Stream ended early ($bytesRemaining bytes short)',
+        );
+      }
+      
       segment.lastError = null;
       segment.retryCount = 0;
     } on DioException catch (e) {
-      if (CancelToken.isCancel(e)) {
-        return; 
-      }
-      if (task.status == DownloadStatus.paused || task.status == DownloadStatus.cancelled) {
-        return;
-      }
+      if (CancelToken.isCancel(e)) return;
+      if (task.status == DownloadStatus.paused || task.status == DownloadStatus.cancelled) return;
       segment.retryCount++;
-      if (segment.retryCount <= 5) {
+      if (segment.retryCount <= 10) {
         task.errorMessage = _getSmartRetryMessage(segment.retryCount);
         task.notifyUI();
+
+        if (segment.retryCount == 1) {
+          NotificationService.show(task.notificationId, 'Download Stalled', '${task.fileName} is retrying near the end...', isLowPriority: true);
+        }
+
         final delay = _getRetryDelay(e, segment.retryCount);
         await Future.delayed(delay);
-        
-        if (task.status == DownloadStatus.paused || task.status == DownloadStatus.cancelled) {
-          return;
-        }
-        await _downloadSegment(task, segment);
+
+        if (task.status == DownloadStatus.paused || task.status == DownloadStatus.cancelled) return;
+        await _downloadSegment(task, segment, raf, lock);
         return;
       }
       segment.lastError = _mapFriendlyError(e);
-    } catch (_) {
-      segment.lastError = 'File system error on part ${segment.index + 1}.';
+    } catch (e, st) {
+      if (task.status == DownloadStatus.paused || task.status == DownloadStatus.cancelled) return;
+      debugPrint('Segment ${segment.index} file system error for ${task.fullPath}: $e\n$st');
+      segment.retryCount++;
+      if (segment.retryCount <= 10) {
+        task.errorMessage = _getSmartRetryMessage(segment.retryCount);
+        task.notifyUI();
+
+        if (segment.retryCount == 1) {
+          NotificationService.show(task.notificationId, 'Download Stalled', '${task.fileName} is retrying near the end...', isLowPriority: true);
+        }
+
+        await Future.delayed(Duration(seconds: math.pow(2, segment.retryCount).toInt()));
+
+        if (task.status == DownloadStatus.paused || task.status == DownloadStatus.cancelled) return;
+        await _downloadSegment(task, segment, raf, lock);
+        return;
+      }
+      segment.lastError = 'File system error on part ${segment.index + 1}: $e';
     }
   }
 
@@ -1942,8 +2188,14 @@ class DownloadManager extends ChangeNotifier {
     int lastReceivedBytes = task.downloadedBytes;
     final targetUrl = task.url;
 
+    int received = task.downloadedBytes;
+
     try {
-      final headers = <String, dynamic>{'User-Agent': kDefaultUserAgent};
+      final headers = <String, dynamic>{
+        'User-Agent': kDefaultUserAgent,
+        ...task.customHeaders,
+        if (task.referer != null && task.referer!.isNotEmpty) 'Referer': task.referer,
+      };
       if (task.downloadedBytes > 0 && task.supportsRange) {
         headers['range'] = 'bytes=${task.downloadedBytes}-';
       }
@@ -1952,15 +2204,20 @@ class DownloadManager extends ChangeNotifier {
         cancelToken: task.cancelToken,
         options: Options(responseType: ResponseType.stream, receiveTimeout: const Duration(seconds: 30), headers: headers),
       ));
-      
+
       if (task.errorMessage.startsWith('🔄')) {
         task.errorMessage = '';
         task.notifyUI();
       }
 
       if (task.downloadedBytes > 0 && task.supportsRange && response.statusCode != 206) {
-        task.downloadedBytes = 0;
-        _cleanupPartialFile(task.fullPath);
+        task.status = DownloadStatus.paused;
+        task.errorMessage = 'Link expired or server rejected resume.';
+        task.cancelToken?.cancel('Resume rejected');
+        task.notifyUI();
+        _persistTask(task, force: true);
+        _processQueue();
+        return;
       }
       final contentLengthStr = response.headers.value(Headers.contentLengthHeader);
       final liveTotalBytes = contentLengthStr != null ? int.tryParse(contentLengthStr) ?? 0 : 0;
@@ -1969,7 +2226,7 @@ class DownloadManager extends ChangeNotifier {
         if (freeBytes != null && freeBytes < liveTotalBytes + DiskSpaceHelper.safetyBufferBytes) {
           task.status = DownloadStatus.failed;
           task.errorMessage = 'Insufficient disk space.';
-          NotificationService.show(task.id.hashCode, 'Download Failed', '${task.fileName} failed: Insufficient space');
+          NotificationService.show(task.notificationId, 'Download Failed', '${task.fileName} failed: Insufficient space');
           task.notifyUI();
           _persistTask(task, force: true);
           _processQueue();
@@ -1983,15 +2240,16 @@ class DownloadManager extends ChangeNotifier {
       try {
         raf = await file.open(mode: task.downloadedBytes > 0 ? FileMode.append : FileMode.write);
         final stream = response.data!.stream;
-        int received = task.downloadedBytes;
         await for (var chunk in stream) {
-          await _throttleBandwidth(chunk.length);
-          raf.writeFromSync(chunk);
+          if (globalSpeedLimitKbps > 0) {
+            await _throttleBandwidth(chunk.length);
+          }
+          await raf.writeFrom(chunk); // 🔥 FIX: Async write to prevent UI block
           received += chunk.length;
           final now = DateTime.now().millisecondsSinceEpoch;
           final timeDiff = now - lastUpdateTime;
           if (timeDiff > 500 || (task.totalBytes > 0 && received == task.totalBytes)) {
-            task.retryCount = 0; 
+            task.retryCount = 0;
             task.status = DownloadStatus.downloading;
             task.downloadedBytes = received;
             task.speedBytesPerSecond = (received - lastReceivedBytes) / (timeDiff / 1000);
@@ -2004,6 +2262,16 @@ class DownloadManager extends ChangeNotifier {
             _persistTask(task);
           }
         }
+        
+        // 🔥 FIX 3: Catch silent CDN disconnects on single stream downloads too
+        if (task.totalBytes > 0 && received < task.totalBytes) {
+          throw DioException(
+            requestOptions: response.requestOptions,
+            type: DioExceptionType.connectionError,
+            message: 'Stream ended early. Expected ${task.totalBytes} but got $received',
+          );
+        }
+
       } finally {
         await raf?.close();
       }
@@ -2013,14 +2281,18 @@ class DownloadManager extends ChangeNotifier {
       }
     } on DioException catch (e) {
       if (!CancelToken.isCancel(e)) {
-        if (task.retryCount < 5) {
+        if (task.retryCount < 10) {
           task.retryCount++;
           task.status = DownloadStatus.waiting;
           task.speedBytesPerSecond = 0;
           task.errorMessage = _getSmartRetryMessage(task.retryCount);
           task.notifyUI();
           _persistTask(task, force: true);
-          
+
+          if (task.retryCount == 1) {
+            NotificationService.show(task.notificationId, 'Download Stalled', '${task.fileName} is retrying near the end...', isLowPriority: true);
+          }
+
           final delay = _getRetryDelay(e, task.retryCount);
           Future.delayed(delay, () {
             if (task.status == DownloadStatus.waiting && !isOffline) {
@@ -2032,25 +2304,47 @@ class DownloadManager extends ChangeNotifier {
         task.status = DownloadStatus.failed;
         task.errorMessage = _mapFriendlyError(e);
         task.speedBytesPerSecond = 0;
-        NotificationService.show(task.id.hashCode, 'Download Failed', '${task.fileName}: ${task.errorMessage}');
+        NotificationService.show(task.notificationId, 'Download Failed', '${task.fileName}: ${task.errorMessage}');
         task.notifyUI();
         _persistTask(task, force: true);
         _processQueue();
       }
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('Single-stream file system error for ${task.fullPath}: $e\n$st');
+      if ([DownloadStatus.paused, DownloadStatus.cancelled].contains(task.status)) return;
+      if (task.retryCount < 10) {
+        task.retryCount++;
+        task.status = DownloadStatus.waiting;
+        task.speedBytesPerSecond = 0;
+        task.errorMessage = _getSmartRetryMessage(task.retryCount);
+        task.notifyUI();
+        _persistTask(task, force: true);
+
+        if (task.retryCount == 1) {
+          NotificationService.show(task.notificationId, 'Download Stalled', '${task.fileName} is retrying near the end...', isLowPriority: true);
+        }
+
+        final delaySeconds = math.pow(2, task.retryCount).toInt();
+        Future.delayed(Duration(seconds: delaySeconds), () {
+          if (task.status == DownloadStatus.waiting && !isOffline) {
+            _processQueue();
+          }
+        });
+        return;
+      }
       task.status = DownloadStatus.failed;
-      task.errorMessage = 'File system error.';
+      task.errorMessage = 'File system error: $e';
       task.speedBytesPerSecond = 0;
-      NotificationService.show(task.id.hashCode, 'Download Failed', '${task.fileName}: File error');
+      NotificationService.show(task.notificationId, 'Download Failed', '${task.fileName}: File error');
       task.notifyUI();
       _persistTask(task, force: true);
       _processQueue();
     }
   }
 
-  void pauseDownload(DownloadTask task) {
+  Future<void> pauseDownload(DownloadTask task) async {
     if (task.isTorrent && task.aria2Gid != null) {
-      torrentEngine.client.pause(task.aria2Gid!).catchError((_) {});
+      torrentEngine.safePause(task.aria2Gid!);
       _progressTimers[task.id]?.cancel();
       _progressTimers.remove(task.id);
       task.status = DownloadStatus.paused;
@@ -2075,6 +2369,9 @@ class DownloadManager extends ChangeNotifier {
     if (task.segments.isNotEmpty && !task.isTorrent) {
       task.downloadedBytes = task.segments.fold<int>(0, (s, seg) => s + seg.downloadedBytes);
     }
+    
+    await _closeSegmentHandle(task.id);
+
     task.notifyUI();
     _persistTask(task, force: true);
     _processQueue();
@@ -2082,8 +2379,8 @@ class DownloadManager extends ChangeNotifier {
 
   void cancelDownload(DownloadTask task) {
     if (task.isTorrent && task.aria2Gid != null) {
-      torrentEngine.client.forceRemove(task.aria2Gid!).catchError((_) {});
-      torrentEngine.client.removeDownloadResult(task.aria2Gid!).catchError((_) {});
+      torrentEngine.safeForceRemove(task.aria2Gid!);
+      torrentEngine.safeRemoveDownloadResult(task.aria2Gid!);
     } else {
       task.cancelToken?.cancel('Cancelled');
       _cancelSegmentTokens(task, 'Cancelled');
@@ -2096,7 +2393,8 @@ class DownloadManager extends ChangeNotifier {
     _progressTimers[task.id]?.cancel();
     _progressTimers.remove(task.id);
     _networkPausedTaskIds.remove(task.id);
-    task.segments = []; 
+    task.segments = [];
+    _closeSegmentHandle(task.id);
     notifyListeners();
     _scheduleNextSchedulerCheck();
     _persistTask(task, force: true);
@@ -2115,7 +2413,7 @@ class DownloadManager extends ChangeNotifier {
 
   void renameTask(DownloadTask task, String newName) {
     if ([DownloadStatus.downloading, DownloadStatus.connecting].contains(task.status) || task.isTorrent) {
-      return; 
+      return;
     }
     final cleanName = newName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
     final oldFile = File(task.fullPath);
@@ -2129,8 +2427,8 @@ class DownloadManager extends ChangeNotifier {
 
   void removeTask(DownloadTask task, {bool deleteFile = false}) {
     if (task.isTorrent && task.aria2Gid != null) {
-      torrentEngine.client.forceRemove(task.aria2Gid!).catchError((_) {});
-      torrentEngine.client.removeDownloadResult(task.aria2Gid!).catchError((_) {});
+      torrentEngine.safeForceRemove(task.aria2Gid!);
+      torrentEngine.safeRemoveDownloadResult(task.aria2Gid!);
     }
 
     activeTasks.remove(task);
@@ -2139,6 +2437,7 @@ class DownloadManager extends ChangeNotifier {
     selectedTaskIds.remove(task.id);
     _progressTimers[task.id]?.cancel();
     _progressTimers.remove(task.id);
+    _closeSegmentHandle(task.id);
     _dbHelper.deleteTask(task.id);
     if (task.status != DownloadStatus.completed || deleteFile) {
       _cleanupPartialFile(task.fullPath);
@@ -2176,6 +2475,30 @@ class DownloadManager extends ChangeNotifier {
         String msg = e.message ?? 'Unknown error';
         if (msg.length > 50) msg = '${msg.substring(0, 50)}...';
         return msg;
+    }
+  }
+
+  Future<void> updateTaskUrl(DownloadTask task, String newUrl) async {
+    task.status = DownloadStatus.connecting;
+    task.errorMessage = 'Refreshing link...';
+    task.notifyUI();
+
+    final meta = await fetchFileMetadata(
+      newUrl,
+      customHeaders: task.customHeaders,
+      referer: task.referer,
+    );
+    if (meta['success'] == true) {
+      task.url = meta['cleanUrl'];
+      task.supportsRange = meta['supportsRange'];
+      task.errorMessage = '';
+      task.retryCount = 0;
+      _dbHelper.upsertTask(task);
+      enqueueDownload(task);
+    } else {
+      task.status = DownloadStatus.paused;
+      task.errorMessage = 'Failed to verify new link: ${meta['error']}';
+      task.notifyUI();
     }
   }
 }
@@ -2285,9 +2608,9 @@ class SpeedGraphPainter extends CustomPainter {
     for (int i = 0; i <= 4; i++) {
       double y = size.height - (i * size.height / 4);
       double speedVal = (i / 4) * maxSpeed;
-      
+
       canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
-      
+
       if (i > 0) {
         final textSpan = TextSpan(text: FormattingHelper.formatSpeed(speedVal), style: textStyle);
         final textPainter = TextPainter(text: textSpan, textDirection: TextDirection.ltr);
@@ -2303,7 +2626,7 @@ class SpeedGraphPainter extends CustomPainter {
     void drawLine(Color color, double Function(SpeedPoint) getValue) {
       final path = Path();
       final fillPath = Path();
-      
+
       path.moveTo(0, size.height - (getValue(history[0]) / maxSpeed) * size.height);
       fillPath.moveTo(0, size.height);
       fillPath.lineTo(0, size.height - (getValue(history[0]) / maxSpeed) * size.height);
@@ -2364,7 +2687,7 @@ class _SpeedCenterDialogState extends State<SpeedCenterDialog> {
         children: [
           Icon(Icons.speed, color: theme.colorScheme.primary),
           const SizedBox(width: 8),
-          const Expanded(child: Text('Speed Center')),
+          const Text('Speed Center'),
         ],
       ),
       content: SizedBox(
@@ -2384,10 +2707,8 @@ class _SpeedCenterDialogState extends State<SpeedCenterDialog> {
                 const Text('TODAY', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2, fontSize: 12)),
                 const SizedBox(height: 12),
                 SafeDenseContainer(
-                  child: Wrap(
-                    alignment: WrapAlignment.spaceBetween,
-                    spacing: 8,
-                    runSpacing: 12,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       _buildStatCol('Downloaded', FormattingHelper.formatBytes(dlBytes), Colors.blue),
                       _buildStatCol('Uploaded', FormattingHelper.formatBytes(ulBytes), Colors.purple),
@@ -2399,16 +2720,11 @@ class _SpeedCenterDialogState extends State<SpeedCenterDialog> {
                 const SizedBox(height: 24),
                 const Divider(),
                 const SizedBox(height: 16),
-                
-                Wrap(
-                  alignment: WrapAlignment.spaceBetween,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  spacing: 8,
-                  runSpacing: 8,
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     const Text('NETWORK ACTIVITY', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2, fontSize: 12)),
-                    Wrap(
-                      spacing: 8,
+                    Row(
                       children: [
                         FilterChip(
                           label: const Text('Download'),
@@ -2418,6 +2734,7 @@ class _SpeedCenterDialogState extends State<SpeedCenterDialog> {
                           labelStyle: TextStyle(color: _showDownload ? Colors.blue : theme.hintColor),
                           onSelected: (val) => setState(() => _showDownload = val),
                         ),
+                        const SizedBox(width: 8),
                         FilterChip(
                           label: const Text('Upload'),
                           selected: _showUpload,
@@ -2431,7 +2748,6 @@ class _SpeedCenterDialogState extends State<SpeedCenterDialog> {
                   ],
                 ),
                 const SizedBox(height: 16),
-
                 Container(
                   height: 200,
                   decoration: BoxDecoration(
@@ -2508,7 +2824,7 @@ class TorrentDetailsScreen extends StatelessWidget {
           progress = progress.clamp(0.0, 1.0);
           final percent = (progress * 100).toStringAsFixed(1);
           final isActive = [DownloadStatus.downloading, DownloadStatus.connecting].contains(task.status);
-          
+
           return SingleChildScrollView(
             padding: const EdgeInsets.all(24),
             child: Column(
@@ -2524,7 +2840,6 @@ class TorrentDetailsScreen extends StatelessWidget {
                 const SizedBox(height: 24),
                 const Divider(),
                 const SizedBox(height: 16),
-                
                 Text('$percent% complete', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 8),
                 ClipRRect(
@@ -2544,11 +2859,9 @@ class TorrentDetailsScreen extends StatelessWidget {
                     Text(isActive ? 'ETA ${FormattingHelper.formatEta(task.etaSeconds)}' : task.status.name.toUpperCase(), style: TextStyle(fontSize: 16, color: theme.hintColor)),
                   ],
                 ),
-                
                 const SizedBox(height: 16),
                 const Divider(),
                 const SizedBox(height: 16),
-
                 const Text('OVERVIEW', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
                 const SizedBox(height: 16),
                 _buildStatRow('Download', '${FormattingHelper.formatBytes(task.downloadedBytes)} / ${task.totalBytes > 0 ? FormattingHelper.formatBytes(task.totalBytes) : 'Unknown'}'),
@@ -2557,11 +2870,9 @@ class TorrentDetailsScreen extends StatelessWidget {
                 _buildStatRow('Seeds', task.seeds.toString()),
                 _buildStatRow('Connections', task.peers.toString()),
                 _buildStatRow('Status', task.status.name.substring(0, 1).toUpperCase() + task.status.name.substring(1)),
-
                 const SizedBox(height: 16),
                 const Divider(),
                 const SizedBox(height: 16),
-
                 const Text('FILES', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
                 const SizedBox(height: 12),
                 if (task.torrentFiles.isEmpty)
@@ -2573,20 +2884,17 @@ class TorrentDetailsScreen extends StatelessWidget {
                   TorrentFileListTable(
                     task: task,
                     scrollable: false,
-                    onSelectionChanged: () {}, 
+                    onSelectionChanged: () {},
                   ),
-
                 const SizedBox(height: 16),
                 const Divider(),
                 const SizedBox(height: 16),
-
                 const Text('NETWORK', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
                 const SizedBox(height: 16),
                 _buildNetworkRow('DHT', 'Connected', true),
                 _buildNetworkRow('PEX', 'Enabled', true),
                 _buildNetworkRow('Tracker', '${task.peers} peers', true),
                 _buildNetworkRow('Port', '6881', true),
-
                 const SizedBox(height: 48),
                 Center(
                   child: OutlinedButton.icon(
@@ -2837,14 +3145,15 @@ class TorrentDownloadCard extends StatelessWidget {
     final isPaused = task.status == DownloadStatus.paused;
     final isQueued = task.status == DownloadStatus.waiting;
 
-    showMenu<void>(
+    showMenu<String>(
       context: context,
       position: RelativeRect.fromRect(position & const Size(40, 40), Offset.zero & overlay.size),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      items: <PopupMenuEntry<void>>[
-        PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.check_box_outlined), title: Text('Select')), onTap: () => downloadManager.toggleSelection(task.id)),
-        
-        if (task.isTorrent && (isDownloading || isPaused || isQueued)) PopupMenuItem<void>(
+      items: <PopupMenuEntry<String>>[
+        PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.check_box_outlined), title: Text('Select')), onTap: () => downloadManager.toggleSelection(task.id)),
+        if (task.url.toLowerCase().startsWith('magnet:?')) ...handoffMenuEntries(),
+
+        if (task.isTorrent && (isDownloading || isPaused || isQueued)) PopupMenuItem<String>(
           child: const ListTile(leading: Icon(Icons.list), title: Text('Select Files')),
           onTap: () async {
             await Future.delayed(Duration.zero);
@@ -2853,10 +3162,10 @@ class TorrentDownloadCard extends StatelessWidget {
           }
         ),
 
-        if (isPaused) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.play_arrow), title: Text('Resume')), onTap: () => downloadManager.enqueueDownload(task)),
-        if (isQueued) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.flash_on), title: Text('Force Start')), onTap: () => downloadManager.forceStartDownload(task)),
-        if (isDownloading) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.pause), title: Text('Pause')), onTap: () => downloadManager.pauseDownload(task)),
-        PopupMenuItem<void>(
+        if (isPaused) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.play_arrow), title: Text('Resume')), onTap: () => downloadManager.enqueueDownload(task)),
+        if (isQueued) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.flash_on), title: Text('Force Start')), onTap: () => downloadManager.forceStartDownload(task)),
+        if (isDownloading) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.pause), title: Text('Pause')), onTap: () => downloadManager.pauseDownload(task)),
+        PopupMenuItem<String>(
           child: const ListTile(leading: Icon(Icons.delete, color: Colors.red), title: Text('Delete', style: TextStyle(color: Colors.red))),
           onTap: () async {
             await Future.delayed(Duration.zero);
@@ -2865,7 +3174,11 @@ class TorrentDownloadCard extends StatelessWidget {
           }
         ),
       ],
-    );
+    ).then((value) {
+      if (value == 'send_to_pc' && context.mounted) {
+        handoffSendTask(context, task);
+      }
+    });
   }
 
   void _showTorrentContentDialog(BuildContext context) {
@@ -2936,6 +3249,7 @@ class TorrentDownloadCard extends StatelessWidget {
 
         final isActive = [DownloadStatus.downloading, DownloadStatus.connecting].contains(task.status);
         final isQueued = task.status == DownloadStatus.waiting;
+        final isFailed = task.status == DownloadStatus.failed;
 
         return GestureDetector(
           onLongPress: () => downloadManager.toggleSelection(task.id),
@@ -3060,6 +3374,11 @@ class TorrentDownloadCard extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 8),
+                  if (isFailed && task.errorMessage.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8.0),
+                      child: Text('⚠ ${task.errorMessage}', style: const TextStyle(color: Colors.red, fontSize: 12)),
+                    ),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -3076,10 +3395,11 @@ class TorrentDownloadCard extends StatelessWidget {
                             )
                           else
                             IconButton(
-                              icon: const Icon(Icons.play_arrow, size: 20),
+                              icon: Icon(isFailed ? Icons.refresh : Icons.play_arrow, size: 20),
                               constraints: const BoxConstraints(),
                               padding: const EdgeInsets.symmetric(horizontal: 8),
-                              onPressed: () => downloadManager.enqueueDownload(task),
+                              tooltip: isFailed ? 'Retry' : null,
+                              onPressed: () => isFailed ? downloadManager.retryDownload(task) : downloadManager.enqueueDownload(task),
                             ),
                           IconButton(
                             icon: const Icon(Icons.close, size: 20),
@@ -3129,20 +3449,21 @@ class DetailedDownloadCard extends StatelessWidget {
     final isPaused = task.status == DownloadStatus.paused;
     final isQueued = task.status == DownloadStatus.waiting;
 
-    showMenu<void>(
+    showMenu<String>(
       context: context,
       position: RelativeRect.fromRect(position & const Size(40, 40), Offset.zero & overlay.size),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      items: <PopupMenuEntry<void>>[
-        PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.check_box_outlined), title: Text('Select')), onTap: () => downloadManager.toggleSelection(task.id)),
-        
-        if (isPaused) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.play_arrow), title: Text('Resume')), onTap: () => downloadManager.enqueueDownload(task)),
-        if (isQueued) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.flash_on), title: Text('Download Now')), onTap: () => downloadManager.forceStartDownload(task)),
-        if (isDownloading) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.pause), title: Text('Pause')), onTap: () => downloadManager.pauseDownload(task)),
+      items: <PopupMenuEntry<String>>[
+        PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.check_box_outlined), title: Text('Select')), onTap: () => downloadManager.toggleSelection(task.id)),
+        ...handoffMenuEntries(),
+
+        if (isPaused) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.play_arrow), title: Text('Resume')), onTap: () => downloadManager.enqueueDownload(task)),
+        if (isQueued) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.flash_on), title: Text('Download Now')), onTap: () => downloadManager.forceStartDownload(task)),
+        if (isDownloading) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.pause), title: Text('Pause')), onTap: () => downloadManager.pauseDownload(task)),
         if (task.status == DownloadStatus.failed || task.status == DownloadStatus.cancelled)
-          PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.refresh), title: Text('Retry')), onTap: () => downloadManager.retryDownload(task)),
-        if (isCompleted) PopupMenuItem<void>(child: const ListTile(leading: Icon(Icons.folder_open), title: Text('Open File')), onTap: () => OpenFilex.open(task.fullPath)),
-        if (isCompleted) PopupMenuItem<void>(
+          PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.refresh), title: Text('Retry')), onTap: () => downloadManager.retryDownload(task)),
+        if (isCompleted) PopupMenuItem<String>(child: const ListTile(leading: Icon(Icons.folder_open), title: Text('Open File')), onTap: () => OpenFilex.open(task.fullPath)),
+        if (isCompleted) PopupMenuItem<String>(
           child: const ListTile(leading: Icon(Icons.folder), title: Text('Open Folder')),
           onTap: () {
             if (Platform.isWindows) {
@@ -3152,7 +3473,7 @@ class DetailedDownloadCard extends StatelessWidget {
             }
           }
         ),
-        if (!isDownloading) PopupMenuItem<void>(
+        if (!isDownloading) PopupMenuItem<String>(
           child: const ListTile(leading: Icon(Icons.schedule), title: Text('Set Schedule')),
           onTap: () async {
             await Future.delayed(Duration.zero);
@@ -3160,7 +3481,7 @@ class DetailedDownloadCard extends StatelessWidget {
             _showTaskScheduleDialog(context);
           }
         ),
-        if (!isDownloading) PopupMenuItem<void>(
+        if (!isDownloading) PopupMenuItem<String>(
           child: const ListTile(leading: Icon(Icons.edit), title: Text('Rename')),
           onTap: () async {
             await Future.delayed(Duration.zero);
@@ -3168,7 +3489,15 @@ class DetailedDownloadCard extends StatelessWidget {
             _showRenameDialog(context);
           }
         ),
-        PopupMenuItem<void>(
+        if (!isDownloading && !isCompleted) PopupMenuItem<String>(
+          child: const ListTile(leading: Icon(Icons.link), title: Text('Update URL')),
+          onTap: () async {
+            await Future.delayed(Duration.zero);
+            if (!context.mounted) return;
+            _showUpdateUrlDialog(context);
+          }
+        ),
+        PopupMenuItem<String>(
           child: const ListTile(leading: Icon(Icons.delete, color: Colors.red), title: Text('Delete', style: TextStyle(color: Colors.red))),
           onTap: () async {
             await Future.delayed(Duration.zero);
@@ -3177,7 +3506,11 @@ class DetailedDownloadCard extends StatelessWidget {
           }
         ),
       ],
-    );
+    ).then((value) {
+      if (value == 'send_to_pc' && context.mounted) {
+        handoffSendTask(context, task);
+      }
+    });
   }
 
   void _showTaskScheduleDialog(BuildContext context) {
@@ -3201,10 +3534,8 @@ class DetailedDownloadCard extends StatelessWidget {
                 activeThumbColor: Theme.of(context).colorScheme.primary,
               ),
               if (localEnabled) ...[
-                Wrap(
-                  alignment: WrapAlignment.spaceEvenly,
-                  spacing: 8,
-                  runSpacing: 8,
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
                     ElevatedButton(
                       onPressed: () async {
@@ -3295,6 +3626,37 @@ class DetailedDownloadCard extends StatelessWidget {
     );
   }
 
+  void _showUpdateUrlDialog(BuildContext context) {
+    final controller = TextEditingController(text: task.url);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Update Download URL'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            labelText: 'New URL',
+            hintText: 'Paste fresh link here...'
+          ),
+          maxLines: 3,
+          minLines: 1,
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () {
+              if (controller.text.trim().isNotEmpty) {
+                downloadManager.updateTaskUrl(task, controller.text.trim());
+              }
+              Navigator.pop(ctx);
+            },
+            child: const Text('Update & Resume'),
+          ),
+        ],
+      )
+    );
+  }
+
   void _showConnectionsDialog(BuildContext context) {
     showDialog(
       context: context,
@@ -3308,7 +3670,7 @@ class DetailedDownloadCard extends StatelessWidget {
               children: [
                 Icon(Icons.bolt, color: Theme.of(ctx).colorScheme.primary),
                 const SizedBox(width: 8),
-                const Expanded(child: Text('Active Connections')),
+                const Text('Active Connections'),
               ],
             ),
             const SizedBox(height: 6),
@@ -3444,175 +3806,202 @@ class DetailedDownloadCard extends StatelessWidget {
               borderRadius: BorderRadius.circular(16),
               side: isSelected ? BorderSide(color: theme.colorScheme.primary, width: 2) : BorderSide.none,
             ),
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
+            child: LayoutBuilder(
+              builder: (context, cardConstraints) {
+                final bool compact = cardConstraints.maxWidth < 380;
+                final double hPad = compact ? 10.0 : 16.0;
+                final double iconBoxPad = compact ? 7.0 : 10.0;
+                final double iconSize = compact ? 22.0 : 28.0;
+                final double gapAfterIcon = compact ? 10.0 : 16.0;
+
+                return Padding(
+                  padding: EdgeInsets.symmetric(horizontal: hPad, vertical: 16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      if (selectionMode) ...[
-                        Checkbox(
-                          value: isSelected,
-                          onChanged: (val) => downloadManager.toggleSelection(task.id),
-                          activeColor: theme.colorScheme.primary,
-                        ),
-                        const SizedBox(width: 4),
-                      ] else if (showDragHandle && listIndex != null) ...[
-                        ReorderableDragStartListener(
-                          index: listIndex!,
-                          child: MouseRegion(
-                            cursor: SystemMouseCursors.grab,
-                            child: Padding(
-                              padding: const EdgeInsets.only(right: 12.0, top: 8.0, bottom: 8.0),
-                              child: Icon(Icons.drag_indicator, color: theme.hintColor.withAlpha(150)),
+                      Row(
+                        children: [
+                          if (selectionMode) ...[
+                            Checkbox(
+                              value: isSelected,
+                              onChanged: (val) => downloadManager.toggleSelection(task.id),
+                              activeColor: theme.colorScheme.primary,
+                              visualDensity: compact ? VisualDensity.compact : VisualDensity.standard,
+                            ),
+                            SizedBox(width: compact ? 0 : 4),
+                          ] else if (showDragHandle && listIndex != null) ...[
+                            ReorderableDragStartListener(
+                              index: listIndex!,
+                              child: MouseRegion(
+                                cursor: SystemMouseCursors.grab,
+                                child: Padding(
+                                  padding: EdgeInsets.only(right: compact ? 6.0 : 12.0, top: 8.0, bottom: 8.0),
+                                  child: Icon(Icons.drag_indicator, color: theme.hintColor.withAlpha(150), size: compact ? 18 : 24),
+                                ),
+                              ),
+                            ),
+                          ],
+                          if (queuePosition != null && !selectionMode) ...[
+                            CircleAvatar(
+                              radius: compact ? 10 : 12,
+                              backgroundColor: theme.colorScheme.primary.withAlpha(30),
+                              child: Text('$queuePosition', style: TextStyle(fontSize: compact ? 10 : 11, fontWeight: FontWeight.bold, color: theme.colorScheme.primary)),
+                            ),
+                            SizedBox(width: compact ? 6 : 10),
+                          ],
+                          Container(
+                            padding: EdgeInsets.all(iconBoxPad),
+                            decoration: BoxDecoration(color: statusColor.withAlpha(20), borderRadius: BorderRadius.circular(12)),
+                            child: Icon(isCompleted ? Icons.check_circle : (isScheduledWaiting ? Icons.schedule : FormattingHelper.getFileIcon(task.fileName, false)), color: statusColor, size: iconSize),
+                          ),
+                          SizedBox(width: gapAfterIcon),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Flexible(
+                                      child: Text(task.fileName, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15), maxLines: 1, overflow: TextOverflow.ellipsis),
+                                    ),
+                                    if (isActive && isSegmented) ...[
+                                      const SizedBox(width: 6),
+                                      InkWell(
+                                        borderRadius: BorderRadius.circular(6),
+                                        onTap: () => _showConnectionsDialog(context),
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                          decoration: BoxDecoration(
+                                            color: theme.colorScheme.primary.withAlpha(25),
+                                            borderRadius: BorderRadius.circular(6),
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(Icons.bolt, size: 11, color: theme.colorScheme.primary),
+                                              const SizedBox(width: 2),
+                                              Text('${task.segments.length}×', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: theme.colorScheme.primary)),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 6),
+                                Row(
+                                  children: [
+                                    Text(
+                                      isFailed ? 'ERROR' : (isScheduledWaiting ? 'SCHEDULED' : (task.errorMessage.startsWith('🔄') ? 'RETRYING' : task.status.name.toUpperCase())),
+                                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isScheduledWaiting ? Colors.deepPurple : (task.errorMessage.startsWith('🔄') ? Colors.orange : theme.hintColor))
+                                    ),
+                                    const SizedBox(width: 8),
+                                    if (isScheduledWaiting && downloadManager.timeUntilNextWindowOpenForTask(task) != null)
+                                      Text('(in ${FormattingHelper.formatEta(downloadManager.timeUntilNextWindowOpenForTask(task)!.inSeconds)})', style: const TextStyle(fontSize: 12, color: Colors.deepPurple))
+                                    else if (!isQueued) ...[
+                                      Text('${FormattingHelper.formatBytes(task.downloadedBytes)} / ${task.totalBytes > 0 ? FormattingHelper.formatBytes(task.totalBytes) : 'Unknown'}', style: TextStyle(fontSize: 12, color: theme.hintColor)),
+                                      if (task.errorMessage.startsWith('🔄')) ...[
+                                        const SizedBox(width: 8),
+                                        Flexible(child: Text(task.errorMessage, style: const TextStyle(fontSize: 12, color: Colors.orange), maxLines: 1, overflow: TextOverflow.ellipsis)),
+                                      ]
+                                    ] else ...[
+                                      Text(task.totalBytes > 0 ? FormattingHelper.formatBytes(task.totalBytes) : 'Size unknown', style: TextStyle(fontSize: 12, color: theme.hintColor)),
+                                      if (task.errorMessage.startsWith('🔄')) ...[
+                                        const SizedBox(width: 8),
+                                        Flexible(child: Text(task.errorMessage, style: const TextStyle(fontSize: 12, color: Colors.orange), maxLines: 1, overflow: TextOverflow.ellipsis)),
+                                      ]
+                                    ]
+                                  ],
+                                ),
+                                if (isCompleted && task.expectedHash.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4.0),
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          task.hashVerified == true ? Icons.verified : (task.hashVerified == false ? Icons.error : Icons.hourglass_empty),
+                                          size: 14,
+                                          color: task.hashVerified == true ? Colors.green : (task.hashVerified == false ? Colors.red : Colors.orange)
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          task.hashVerified == true ? 'Hash Verified' : (task.hashVerified == false ? 'Hash Mismatch' : 'Verifying...'),
+                                          style: TextStyle(fontSize: 11, color: task.hashVerified == true ? Colors.green : (task.hashVerified == false ? Colors.red : Colors.orange))
+                                        )
+                                      ]
+                                    ),
+                                  )
+                              ],
                             ),
                           ),
-                        ),
-                      ],
-                      if (queuePosition != null && !selectionMode) ...[
-                        CircleAvatar(
-                          radius: 12,
-                          backgroundColor: theme.colorScheme.primary.withAlpha(30),
-                          child: Text('$queuePosition', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: theme.colorScheme.primary)),
-                        ),
-                        const SizedBox(width: 10),
-                      ],
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(color: statusColor.withAlpha(20), borderRadius: BorderRadius.circular(12)),
-                        child: Icon(isCompleted ? Icons.check_circle : (isScheduledWaiting ? Icons.schedule : FormattingHelper.getFileIcon(task.fileName, false)), color: statusColor, size: 28),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
+                          if (isActive && !task.errorMessage.startsWith('🔄') && !compact) ...[
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
                               children: [
-                                Flexible(
-                                  child: Text(task.fileName, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15), maxLines: 1, overflow: TextOverflow.ellipsis),
-                                ),
-                                if (isActive && isSegmented) ...[
-                                  const SizedBox(width: 6),
-                                  InkWell(
-                                    borderRadius: BorderRadius.circular(6),
-                                    onTap: () => _showConnectionsDialog(context),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                                      decoration: BoxDecoration(
-                                        color: theme.colorScheme.primary.withAlpha(25),
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(Icons.bolt, size: 11, color: theme.colorScheme.primary),
-                                          const SizedBox(width: 2),
-                                          Text('${task.segments.length}×', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: theme.colorScheme.primary)),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ],
+                                Text(task.errorMessage.isNotEmpty && task.speedBytesPerSecond == 0 ? task.errorMessage : FormattingHelper.formatSpeed(task.speedBytesPerSecond), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                                Text(FormattingHelper.formatEta(task.etaSeconds), style: TextStyle(color: theme.hintColor, fontSize: 12)),
                               ],
                             ),
-                            const SizedBox(height: 6),
-                            Row(
-                              children: [
-                                Text(
-                                  isFailed ? 'ERROR' : (isScheduledWaiting ? 'SCHEDULED' : (task.errorMessage.startsWith('🔄') ? 'RETRYING' : task.status.name.toUpperCase())), 
-                                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isScheduledWaiting ? Colors.deepPurple : (task.errorMessage.startsWith('🔄') ? Colors.orange : theme.hintColor))
-                                ),
-                                const SizedBox(width: 8),
-                                if (isScheduledWaiting && downloadManager.timeUntilNextWindowOpenForTask(task) != null)
-                                  Text('(in ${FormattingHelper.formatEta(downloadManager.timeUntilNextWindowOpenForTask(task)!.inSeconds)})', style: const TextStyle(fontSize: 12, color: Colors.deepPurple))
-                                else if (!isQueued) ...[
-                                  Text('${FormattingHelper.formatBytes(task.downloadedBytes)} / ${task.totalBytes > 0 ? FormattingHelper.formatBytes(task.totalBytes) : 'Unknown'}', style: TextStyle(fontSize: 12, color: theme.hintColor)),
-                                  if (task.errorMessage.startsWith('🔄')) ...[
-                                    const SizedBox(width: 8),
-                                    Flexible(child: Text(task.errorMessage, style: const TextStyle(fontSize: 12, color: Colors.orange), maxLines: 1, overflow: TextOverflow.ellipsis)),
-                                  ]
-                                ] else ...[
-                                  Text(task.totalBytes > 0 ? FormattingHelper.formatBytes(task.totalBytes) : 'Size unknown', style: TextStyle(fontSize: 12, color: theme.hintColor)),
-                                  if (task.errorMessage.startsWith('🔄')) ...[
-                                    const SizedBox(width: 8),
-                                    Flexible(child: Text(task.errorMessage, style: const TextStyle(fontSize: 12, color: Colors.orange), maxLines: 1, overflow: TextOverflow.ellipsis)),
-                                  ]
-                                ]
-                              ],
-                            ),
-                            if (isCompleted && task.expectedHash.isNotEmpty)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 4.0),
-                                child: Row(
-                                  children: [
-                                    Icon(
-                                      task.hashVerified == true ? Icons.verified : (task.hashVerified == false ? Icons.error : Icons.hourglass_empty),
-                                      size: 14,
-                                      color: task.hashVerified == true ? Colors.green : (task.hashVerified == false ? Colors.red : Colors.orange)
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      task.hashVerified == true ? 'Hash Verified' : (task.hashVerified == false ? 'Hash Mismatch' : 'Verifying...'),
-                                      style: TextStyle(fontSize: 11, color: task.hashVerified == true ? Colors.green : (task.hashVerified == false ? Colors.red : Colors.orange))
-                                    )
-                                  ]
-                                ),
-                              )
+                            const SizedBox(width: 16),
                           ],
-                        ),
-                      ),
-                      if (isActive && !task.errorMessage.startsWith('🔄')) ...[
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(task.errorMessage.isNotEmpty && task.speedBytesPerSecond == 0 ? task.errorMessage : FormattingHelper.formatSpeed(task.speedBytesPerSecond), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                            Text(FormattingHelper.formatEta(task.etaSeconds), style: TextStyle(color: theme.hintColor, fontSize: 12)),
-                          ],
-                        ),
-                        const SizedBox(width: 16),
-                      ],
-                      if (!selectionMode) Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (isQueued) IconButton(icon: const Icon(Icons.flash_on), tooltip: 'Download Now', onPressed: () => downloadManager.forceStartDownload(task)),
-                          if (isActive && task.supportsRange) IconButton(icon: const Icon(Icons.pause), onPressed: () => downloadManager.pauseDownload(task)),
-                          if (isPaused) IconButton(icon: const Icon(Icons.play_arrow), onPressed: () => downloadManager.enqueueDownload(task)),
-                          if (isActive || isQueued) IconButton(icon: const Icon(Icons.close), color: Colors.red.shade400, onPressed: () => downloadManager.cancelDownload(task)),
-                          if (isFailed || task.status == DownloadStatus.cancelled) IconButton(icon: const Icon(Icons.refresh), onPressed: () => downloadManager.retryDownload(task)),
-                          if (isCompleted) IconButton(icon: const Icon(Icons.folder_open), color: theme.colorScheme.primary, onPressed: () => Platform.isWindows ? Process.run('explorer.exe', ['/select,', task.fullPath]) : OpenFilex.open(task.saveDirectory)),
-                          IconButton(
-                            icon: const Icon(Icons.more_vert),
-                            onPressed: () {
-                              final RenderBox box = context.findRenderObject() as RenderBox;
-                              final Offset position = box.localToGlobal(Offset(box.size.width, 0));
-                              _showContextMenu(context, position);
-                            },
+                          if (!selectionMode) Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isQueued) IconButton(icon: const Icon(Icons.flash_on), tooltip: 'Download Now', iconSize: compact ? 20 : 24, padding: compact ? const EdgeInsets.symmetric(horizontal: 4) : null, constraints: compact ? const BoxConstraints() : null, onPressed: () => downloadManager.forceStartDownload(task)),
+                              if (isActive && task.supportsRange) IconButton(icon: const Icon(Icons.pause), iconSize: compact ? 20 : 24, padding: compact ? const EdgeInsets.symmetric(horizontal: 4) : null, constraints: compact ? const BoxConstraints() : null, onPressed: () => downloadManager.pauseDownload(task)),
+                              if (isPaused) IconButton(icon: const Icon(Icons.play_arrow), iconSize: compact ? 20 : 24, padding: compact ? const EdgeInsets.symmetric(horizontal: 4) : null, constraints: compact ? const BoxConstraints() : null, onPressed: () => downloadManager.enqueueDownload(task)),
+                              if (isActive || isQueued) IconButton(icon: const Icon(Icons.close), color: Colors.red.shade400, iconSize: compact ? 20 : 24, padding: compact ? const EdgeInsets.symmetric(horizontal: 4) : null, constraints: compact ? const BoxConstraints() : null, onPressed: () => downloadManager.cancelDownload(task)),
+                              if (isFailed || task.status == DownloadStatus.cancelled) IconButton(icon: const Icon(Icons.refresh), iconSize: compact ? 20 : 24, padding: compact ? const EdgeInsets.symmetric(horizontal: 4) : null, constraints: compact ? const BoxConstraints() : null, onPressed: () => downloadManager.retryDownload(task)),
+                              if (isCompleted) IconButton(icon: const Icon(Icons.folder_open), color: theme.colorScheme.primary, iconSize: compact ? 20 : 24, padding: compact ? const EdgeInsets.symmetric(horizontal: 4) : null, constraints: compact ? const BoxConstraints() : null, onPressed: () => Platform.isWindows ? Process.run('explorer.exe', ['/select,', task.fullPath]) : OpenFilex.open(task.saveDirectory)),
+                              IconButton(
+                                icon: const Icon(Icons.more_vert),
+                                iconSize: compact ? 20 : 24,
+                                padding: compact ? const EdgeInsets.only(left: 4) : null,
+                                constraints: compact ? const BoxConstraints() : null,
+                                onPressed: () {
+                                  final RenderBox box = context.findRenderObject() as RenderBox;
+                                  final Offset position = box.localToGlobal(Offset(box.size.width, 0));
+                                  _showContextMenu(context, position);
+                                },
+                              ),
+                            ],
                           ),
                         ],
                       ),
+                      if (isActive && compact && !task.errorMessage.startsWith('🔄')) ...[
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            Text(
+                              task.errorMessage.isNotEmpty && task.speedBytesPerSecond == 0 ? task.errorMessage : FormattingHelper.formatSpeed(task.speedBytesPerSecond),
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                            ),
+                            const SizedBox(width: 8),
+                            Text('· ${FormattingHelper.formatEta(task.etaSeconds)}', style: TextStyle(color: theme.hintColor, fontSize: 12)),
+                          ],
+                        ),
+                      ],
+                      if (isActive || isPaused || isQueued) ...[
+                        const SizedBox(height: 16),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: LinearProgressIndicator(
+                            value: task.totalBytes > 0 ? progress : null,
+                            minHeight: 8,
+                            backgroundColor: theme.dividerColor.withAlpha(100),
+                            valueColor: AlwaysStoppedAnimation<Color>(statusColor),
+                          ),
+                        ),
+                      ],
+                      if (isFailed)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8.0),
+                          child: Text('⚠ ${task.errorMessage}', style: const TextStyle(color: Colors.red, fontSize: 12)),
+                        )
                     ],
                   ),
-                  if (isActive || isPaused || isQueued) ...[
-                    const SizedBox(height: 16),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(6),
-                      child: LinearProgressIndicator(
-                        value: task.totalBytes > 0 ? progress : null,
-                        minHeight: 8,
-                        backgroundColor: theme.dividerColor.withAlpha(100),
-                        valueColor: AlwaysStoppedAnimation<Color>(statusColor),
-                      ),
-                    ),
-                  ],
-                  if (isFailed)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8.0),
-                      child: Text('⚠ ${task.errorMessage}', style: const TextStyle(color: Colors.red, fontSize: 12)),
-                    )
-                ],
-              ),
+                );
+              },
             ),
           ),
         );
@@ -3709,40 +4098,42 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   void _checkClipboard() async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final text = data?.text?.trim() ?? '';
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      final text = data?.text?.trim() ?? '';
 
-    if (text.isEmpty || text == _lastClipboardText) {
-      return;
-    }
+      if (text.isEmpty || text == _lastClipboardText) return;
 
-    final urlRegExp = RegExp(r'^https?://.*\.(zip|rar|7z|iso|exe|msi|pdf|mp4|mkv|mp3|apk|deb|dmg|tar|gz)(\?.*)?$', caseSensitive: false);
-    final isMagnet = text.startsWith('magnet:?');
-    final isLocalTorrent = text.toLowerCase().endsWith('.torrent') && File(text).existsSync();
+      final urlRegExp = RegExp(r'^https?://.*\.(zip|rar|7z|iso|exe|msi|pdf|mp4|mkv|mp3|apk|deb|dmg|tar|gz)(\?.*)?$', caseSensitive: false);
+      final isMagnet = text.startsWith('magnet:?');
+      final isLocalTorrent = text.toLowerCase().endsWith('.torrent') && File(text).existsSync();
 
-    if (urlRegExp.hasMatch(text) || isMagnet || isLocalTorrent) {
-      _lastClipboardText = text;
-      _showSmartClipboardPopup(text);
+      if (urlRegExp.hasMatch(text) || isMagnet || isLocalTorrent) {
+        _lastClipboardText = text;
+        _showSmartClipboardPopup(text).catchError((e) {
+          debugPrint('Clipboard popup failed: $e');
+        });
+      }
+    } catch (e) {
+      debugPrint('Clipboard check failed: $e');
     }
   }
 
   Future<void> _pickTorrentFile() async {
-    final result = await FilePicker.pickFiles(
+    final file = await FilePicker.pickFile(
       type: FileType.custom,
       allowedExtensions: ['torrent'],
       dialogTitle: 'Select .torrent File',
     );
-    if (result.isNotEmpty && result.first.path != null) {
-      _processUrl(result.first.path!);
+    if (file != null && file.path != null) {
+      _processUrl(file.path!);
     }
   }
 
   Future<void> _showSmartClipboardPopup(String url) async {
     final metadata = await downloadManager.fetchFileMetadata(url);
 
-    if (!mounted || metadata['success'] != true) {
-      return;
-    }
+    if (!mounted || metadata['success'] != true) return;
 
     final currentDir = metadata['saveDirectory'];
     final freeBytes = await DiskSpaceHelper.getFreeBytes(currentDir);
@@ -3813,14 +4204,28 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                   ),
                 ),
               const SizedBox(height: 16),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
+              Wrap(
+                alignment: WrapAlignment.end,
+                spacing: 8,
+                runSpacing: 8,
                 children: [
                   TextButton(
                     onPressed: () => ScaffoldMessenger.of(context).hideCurrentSnackBar(),
                     child: Text('Ignore', style: TextStyle(color: theme.hintColor)),
                   ),
-                  const SizedBox(width: 12),
+                  if (HandoffActions.available)
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.computer, size: 18),
+                      label: const Text('Send to PC'),
+                      onPressed: () {
+                        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                        HandoffActions.send(
+                          context,
+                          url: metadata['cleanUrl'],
+                          fileName: metadata['fileName'],
+                        );
+                      },
+                    ),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(
                       backgroundColor: theme.colorScheme.primary,
@@ -3854,9 +4259,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     setState(() => _isChecking = true);
     final metadata = await downloadManager.fetchFileMetadata(url);
 
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
     setState(() => _isChecking = false);
 
     if (metadata['success'] == true) {
@@ -3865,13 +4268,14 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         metadata['saveDirectory'] as String,
         metadata['fileName'] as String,
       );
+      if (!mounted) return;
+      
       if (dup.hasMatch) {
         _showDuplicateDialog(dup, metadata);
       } else {
         _showAddDialog(metadata);
       }
     } else {
-      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(metadata['error']), backgroundColor: Colors.red));
     }
   }
@@ -3884,7 +4288,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(children: [Icon(Icons.warning_amber_rounded, color: Colors.orange), SizedBox(width: 8), Expanded(child: Text('Possible Duplicate'))]),
+        title: const Row(children: [Icon(Icons.warning_amber_rounded, color: Colors.orange), SizedBox(width: 8), Text('Possible Duplicate')]),
         content: Text(
           isCompletedOnly
               ? '"${existing.fileName}" already appears to be downloaded in this folder.'
@@ -3955,7 +4359,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
           return AlertDialog(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: Row(children: [Icon(isTorrent ? Icons.cloud_download : Icons.download, color: isTorrent ? Colors.blue : Theme.of(context).colorScheme.primary), const SizedBox(width: 8), const Expanded(child: Text('Add Download'))]),
+            title: Row(children: [Icon(isTorrent ? Icons.cloud_download : Icons.download, color: isTorrent ? Colors.blue : Theme.of(context).colorScheme.primary), const SizedBox(width: 8), const Text('Add Download')]),
             content: SizedBox(
               width: dialogWidth,
               child: SingleChildScrollView(
@@ -3971,20 +4375,25 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     if (!isTorrent) Row(
                       children: [
                         Expanded(
+                          flex: 3,
                           child: TextField(
                             onChanged: (v) => expectedHash = v,
-                            decoration: _dialogInputDecoration(context, 'Expected Hash'),
+                            decoration: _dialogInputDecoration(context, 'Expected Hash (Optional)'),
                           ),
                         ),
                         const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          decoration: BoxDecoration(color: Theme.of(context).dividerColor.withAlpha(20), borderRadius: BorderRadius.circular(8)),
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<String>(
-                              value: hashAlgorithm,
-                              items: ['MD5', 'SHA-1', 'SHA-256'].map((e) => DropdownMenuItem(value: e, child: Text(e, style: const TextStyle(fontSize: 14)))).toList(),
-                              onChanged: (v) => setDialogState(() => hashAlgorithm = v!),
+                        Expanded(
+                          flex: 1,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            decoration: BoxDecoration(color: Theme.of(context).dividerColor.withAlpha(20), borderRadius: BorderRadius.circular(8)),
+                            child: DropdownButtonHideUnderline(
+                              child: DropdownButton<String>(
+                                value: hashAlgorithm,
+                                isExpanded: true,
+                                items: ['MD5', 'SHA-1', 'SHA-256'].map((e) => DropdownMenuItem(value: e, child: Text(e, style: const TextStyle(fontSize: 14)))).toList(),
+                                onChanged: (v) => setDialogState(() => hashAlgorithm = v!),
+                              ),
                             ),
                           ),
                         ),
@@ -4045,9 +4454,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     AnimatedBuilder(
                       animation: downloadManager,
                       builder: (context, _) {
-                        if (!downloadManager.isOffline) {
-                          return const SizedBox.shrink();
-                        }
+                        if (!downloadManager.isOffline) return const SizedBox.shrink();
                         return Padding(
                           padding: const EdgeInsets.only(top: 8),
                           child: Row(
@@ -4069,10 +4476,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                       activeThumbColor: Theme.of(context).colorScheme.primary,
                     ),
                     if (enableSchedule) ...[
-                      Wrap(
-                        alignment: WrapAlignment.spaceEvenly,
-                        spacing: 8,
-                        runSpacing: 8,
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
                           ElevatedButton.icon(
                             icon: const Icon(Icons.play_circle_outline, size: 18),
@@ -4105,6 +4510,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             actionsOverflowButtonSpacing: 8,
             actions: [
               TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+              SendToPcButton(
+                url: () => meta['cleanUrl'] as String? ?? '',
+                fileName: () => nameController.text,
+              ),
               if (enableSchedule)
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.primary, foregroundColor: Colors.white),
@@ -4277,10 +4686,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     activeThumbColor: Theme.of(context).colorScheme.primary,
                   ),
                   if (downloadManager.isSchedulerEnabled) ...[
-                    Wrap(
-                      alignment: WrapAlignment.spaceEvenly,
-                      spacing: 8,
-                      runSpacing: 8,
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       children: [
                         ElevatedButton.icon(
                           icon: const Icon(Icons.play_circle_outline, size: 18),
@@ -4313,11 +4720,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                           children: [
                             Icon(Icons.info_outline, size: 14, color: Theme.of(context).hintColor),
                             const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(
-                                'Outside the window right now — resumes in ${FormattingHelper.formatEta(downloadManager.timeUntilNextWindowOpen!.inSeconds)}.',
-                                style: TextStyle(fontSize: 12, color: Theme.of(context).hintColor),
-                              ),
+                            Text(
+                              'Outside the window right now — resumes in ${FormattingHelper.formatEta(downloadManager.timeUntilNextWindowOpen!.inSeconds)}.',
+                              style: TextStyle(fontSize: 12, color: Theme.of(context).hintColor),
                             ),
                           ],
                         ),
@@ -4339,6 +4744,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     },
                     activeThumbColor: Theme.of(context).colorScheme.primary,
                   ),
+                  const Divider(),
+                  const HandoffSettingsSection(),
                 ],
               ),
             ),
@@ -4394,40 +4801,43 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         return Scaffold(
           drawer: isMobile ? Drawer(child: SafeArea(child: _buildSidebar())) : null,
           appBar: isSelectionMode ? _buildSelectionAppBar() : _buildDefaultAppBar(isMobile),
-          body: Column(
-            children: [
-              if (downloadManager.isOffline) _buildOfflineBanner(),
-              if (downloadManager.isSchedulerEnabled && !downloadManager.isOffline) _buildSchedulerBanner(isMobile),
-              Expanded(
-                child: DropTarget(
-                  onDragDone: (detail) {
-                    if (detail.files.isNotEmpty) {
-                      _processUrl(detail.files.first.path);
-                    }
-                  },
-                  onDragEntered: (detail) => setState(() => _isDragging = true),
-                  onDragExited: (detail) => setState(() => _isDragging = false),
-                  child: Container(
-                    color: _isDragging ? Theme.of(context).colorScheme.primary.withAlpha(20) : null,
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final bool narrow = constraints.maxWidth < _mobileBreakpoint;
-                        if (narrow) {
-                          return _buildMainContent(isMobile: true);
-                        }
-                        return Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _buildSidebar(),
-                            Expanded(child: _buildMainContent(isMobile: false)),
-                          ],
-                        );
-                      },
+          body: SafeArea(
+            top: false,
+            child: Column(
+              children: [
+                if (downloadManager.isOffline) _buildOfflineBanner(),
+                if (downloadManager.isSchedulerEnabled && !downloadManager.isOffline) _buildSchedulerBanner(isMobile),
+                Expanded(
+                  child: DropTarget(
+                    onDragDone: (detail) {
+                      if (detail.files.isNotEmpty) {
+                        _processUrl(detail.files.first.path);
+                      }
+                    },
+                    onDragEntered: (detail) => setState(() => _isDragging = true),
+                    onDragExited: (detail) => setState(() => _isDragging = false),
+                    child: Container(
+                      color: _isDragging ? Theme.of(context).colorScheme.primary.withAlpha(20) : null,
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final bool narrow = constraints.maxWidth < _mobileBreakpoint;
+                          if (narrow) {
+                            return _buildMainContent(isMobile: true);
+                          }
+                          return Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _buildSidebar(),
+                              Expanded(child: _buildMainContent(isMobile: false)),
+                            ],
+                          );
+                        },
+                      ),
                     ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         );
       }
@@ -5003,15 +5413,14 @@ class _BatchImportDialogWidgetState extends State<BatchImportDialogWidget> {
   }
 
   Future<void> _initDefaultDir() async {
-    final dir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
-    if (!mounted) return;
+    final dir = await getDefaultDownloadDir();
     setState(() => _batchSaveDir = dir.path);
   }
 
   Future<void> _processBatchText() async {
     final text = _batchController.text;
     if (text.isEmpty) return;
-    
+
     setState(() {
       _isProcessing = true;
       _parsedUrls = [];
@@ -5019,7 +5428,7 @@ class _BatchImportDialogWidgetState extends State<BatchImportDialogWidget> {
 
     final lines = text.split('\n');
     final validUrls = <String>[];
-    
+
     for (final line in lines) {
       final trimmed = line.trim();
       if (trimmed.isNotEmpty && (trimmed.startsWith('http') || trimmed.startsWith('magnet:?'))) {
@@ -5047,11 +5456,11 @@ class _BatchImportDialogWidgetState extends State<BatchImportDialogWidget> {
   void _addParsedDownloads() {
     for (final meta in _parsedUrls) {
       downloadManager.enqueueDownload(DownloadTask(
-        id: DateTime.now().millisecondsSinceEpoch.toString() + meta['cleanUrl'].hashCode.toString(), 
-        url: meta['cleanUrl'], 
-        fileName: meta['fileName'], 
-        saveDirectory: meta['saveDirectory'], 
-        totalBytes: meta['totalBytes'], 
+        id: DateTime.now().millisecondsSinceEpoch.toString() + meta['cleanUrl'].hashCode.toString(),
+        url: meta['cleanUrl'],
+        fileName: meta['fileName'],
+        saveDirectory: meta['saveDirectory'],
+        totalBytes: meta['totalBytes'],
         supportsRange: meta['supportsRange'],
       ));
     }
@@ -5067,17 +5476,25 @@ class _BatchImportDialogWidgetState extends State<BatchImportDialogWidget> {
 
   @override
   Widget build(BuildContext context) {
+    final screenSize = MediaQuery.of(context).size;
+    final bool isMobile = screenSize.width < 600;
+    final double dialogWidth = isMobile ? screenSize.width * 0.92 : 600;
+    final double dialogHeight = isMobile ? screenSize.height * 0.7 : 400;
+
     return AlertDialog(
+      insetPadding: isMobile
+          ? const EdgeInsets.symmetric(horizontal: 12, vertical: 24)
+          : const EdgeInsets.symmetric(horizontal: 40, vertical: 24),
       title: const Row(
         children: [
           Icon(Icons.library_add),
           SizedBox(width: 8),
-          Expanded(child: Text('Batch Import Downloads')),
+          Flexible(child: Text('Batch Import Downloads', overflow: TextOverflow.ellipsis)),
         ],
       ),
       content: SizedBox(
-        width: 600,
-        height: 400,
+        width: dialogWidth,
+        height: dialogHeight,
         child: Column(
           children: [
             if (_parsedUrls.isEmpty) ...[
@@ -5108,12 +5525,12 @@ class _BatchImportDialogWidgetState extends State<BatchImportDialogWidget> {
                     label: const Text('Change'),
                     onPressed: () async {
                       final picked = await FilePicker.getDirectoryPath(dialogTitle: 'Select Location');
-                      if (picked != null && mounted) {
+                      if (picked != null) {
                         setState(() => _batchSaveDir = picked);
                       }
                     },
                   )
-                ],
+                ]
               )
             ] else ...[
               Text('Found ${_parsedUrls.length} valid links. Review them below before adding.'),
@@ -5144,7 +5561,7 @@ class _BatchImportDialogWidgetState extends State<BatchImportDialogWidget> {
         if (_parsedUrls.isEmpty)
           ElevatedButton(
             onPressed: _isProcessing || _batchController.text.trim().isEmpty ? null : _processUrlList,
-            child: _isProcessing 
+            child: _isProcessing
               ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
               : const Text('Scan Links'),
           )
