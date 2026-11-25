@@ -23,15 +23,13 @@ dependencies:
   flutter_local_notifications: ^22.3.0
   crypto: ^3.0.7
   qr_flutter: ^4.1.0
-  # Removed mobile_scanner (no Windows support)
-  # Added simple_barcode_scanner (supports Windows, Web, iOS, Android)
-  simple_barcode_scanner: ^0.6.1 
   nsd: ^4.0.0
   permission_handler: ^13.0.2
   shelf: ^1.4.2
   shelf_router: ^1.1.4
   device_info_plus: 13.2.0
   flutter_foreground_task: ^11.0.3
+  mobile_scanner: ^7.5.0
 
 dev_dependencies:
   flutter_test:
