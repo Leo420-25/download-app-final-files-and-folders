@@ -2,7 +2,7 @@
 // Phone <-> PC link handoff over the local network, paired with a QR code.
 //
 // Put this file next to main.dart in lib/. main.dart already imports it.
-// Needs in pubspec.yaml: qr_flutter, simple_barcode_scanner
+// Needs in pubspec.yaml: qr_flutter, mobile_scanner, permission_handler
 //
 // How it works:
 //  * Every device runs a tiny HTTP receiver on the LAN (port 47653+).
@@ -17,13 +17,19 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:simple_barcode_scanner/simple_barcode_scanner.dart';
+import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 // main.dart <-> handoff_ui.dart import each other. Dart allows that.
 import 'main.dart';
 
 const int kHandoffBasePort = 47653;
+
+typedef _JsonMap = Map<String, dynamic>;
+typedef _StringList = List<String>;
+typedef _MenuEntry = PopupMenuEntry<String>;
 
 // ==========================================
 // HELPERS
@@ -47,7 +53,7 @@ int _ipRank(String ip) {
   return 3;
 }
 
-Future<List<String>> _localIps() async {
+Future<_StringList> _localIps() async {
   final ips = <String>[];
   try {
     final ifs = await NetworkInterface.list(type: InternetAddressType.IPv4, includeLoopback: false);
@@ -64,7 +70,7 @@ Future<List<String>> _localIps() async {
 
 class _HttpResult {
   final int status;
-  final Map<String, dynamic> body;
+  final _JsonMap body;
   _HttpResult(this.status, this.body);
 }
 
@@ -72,7 +78,7 @@ Future<_HttpResult> _postJson(
   String host,
   int port,
   String path,
-  Map<String, dynamic> payload, {
+  _JsonMap payload, {
   String? token,
   Duration timeout = const Duration(seconds: 4),
 }) async {
@@ -84,10 +90,10 @@ Future<_HttpResult> _postJson(
     req.add(utf8.encode(jsonEncode(payload)));
     final res = await req.close().timeout(timeout * 2);
     final text = await utf8.decodeStream(res).timeout(timeout);
-    Map<String, dynamic> body = {};
+    _JsonMap body = {};
     try {
       final d = jsonDecode(text);
-      if (d is Map<String, dynamic>) body = d;
+      if (d is _JsonMap) body = d;
     } catch (_) {}
     return _HttpResult(res.statusCode, body);
   } finally {
@@ -120,7 +126,7 @@ class HandoffPeer {
     required this.inToken,
   });
 
-  Map<String, dynamic> toJson() => {
+  _JsonMap toJson() => {
         'id': id,
         'name': name,
         'host': host,
@@ -129,7 +135,7 @@ class HandoffPeer {
         'in': inToken,
       };
 
-  static HandoffPeer fromJson(Map<String, dynamic> j) => HandoffPeer(
+  static HandoffPeer fromJson(_JsonMap j) => HandoffPeer(
         id: j['id'] as String,
         name: j['name'] as String,
         host: j['host'] as String,
@@ -191,7 +197,7 @@ class HandoffController extends ChangeNotifier {
         final list = jsonDecode(raw) as List;
         _peers
           ..clear()
-          ..addAll(list.map((e) => HandoffPeer.fromJson(e as Map<String, dynamic>)));
+          ..addAll(list.map((e) => HandoffPeer.fromJson(e as _JsonMap)));
       }
     } catch (e) {
       debugPrint('Handoff init (settings) failed: $e');
@@ -240,18 +246,18 @@ class HandoffController extends ChangeNotifier {
     debugPrint('Handoff receiver could not bind any port.');
   }
 
-  Future<Map<String, dynamic>> _readJson(HttpRequest req) async {
+  Future<_JsonMap> _readJson(HttpRequest req) async {
     final bytes = <int>[];
     await for (final chunk in req) {
       bytes.addAll(chunk);
       if (bytes.length > 65536) throw const FormatException('Body too large');
     }
     final d = jsonDecode(utf8.decode(bytes));
-    if (d is! Map<String, dynamic>) throw const FormatException('Expected JSON object');
+    if (d is! _JsonMap) throw const FormatException('Expected JSON object');
     return d;
   }
 
-  Future<void> _reply(HttpRequest req, int status, Map<String, dynamic> body) async {
+  Future<void> _reply(HttpRequest req, int status, _JsonMap body) async {
     req.response
       ..statusCode = status
       ..headers.contentType = ContentType.json
@@ -383,10 +389,10 @@ class HandoffController extends ChangeNotifier {
 
   /// Called on the device that SCANNED the QR. Returns an error message or null.
   Future<String?> pairFromQr(String raw) async {
-    Map<String, dynamic> j;
+    _JsonMap j;
     try {
       final d = jsonDecode(raw);
-      if (d is! Map<String, dynamic> || d['t'] != 'tasky-handoff') throw const FormatException();
+      if (d is! _JsonMap || d['t'] != 'tasky-handoff') throw const FormatException();
       j = d;
     } catch (_) {
       return 'That QR code is not a Tasky pairing code.';
@@ -566,8 +572,26 @@ class HandoffActions {
   static Future<void> scanAndPair(BuildContext context) async {
     final navigator = Navigator.of(context);
     final messenger = ScaffoldMessenger.of(context);
+    String? raw;
 
-    final raw = await navigator.push<String>(MaterialPageRoute(builder: (_) => const HandoffScanPage()));
+    if (Platform.isAndroid || Platform.isIOS) {
+      final status = await Permission.camera.request();
+      if (!status.isGranted) {
+        messenger.showSnackBar(SnackBar(
+          content: const Text('Camera permission is needed to scan the QR code.'),
+          action: status.isPermanentlyDenied
+              ? SnackBarAction(label: 'Settings', onPressed: openAppSettings)
+              : null,
+        ));
+        return;
+      }
+      if (!context.mounted) return;
+      raw = await navigator.push<String>(MaterialPageRoute(builder: (_) => const HandoffScanPage()));
+    } else {
+      // Windows/desktop: no live camera scanner, so paste the pairing code instead.
+      raw = await _askPairingCode(context);
+    }
+
     if (raw == null || !context.mounted) return;
 
     showDialog(
@@ -593,12 +617,49 @@ class HandoffActions {
       backgroundColor: err == null ? null : Colors.red,
     ));
   }
+
+  static Future<String?> _askPairingCode(BuildContext context) {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Enter pairing code'),
+        content: SizedBox(
+          width: 360,
+          child: TextField(
+            controller: ctrl,
+            autofocus: true,
+            minLines: 3,
+            maxLines: 5,
+            decoration: const InputDecoration(
+              hintText: 'Paste the pairing code from the other device',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () async {
+              final d = await Clipboard.getData('text/plain');
+              if (d?.text != null) ctrl.text = d!.text!;
+            },
+            child: const Text('Paste'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('Pair'),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// Used by main.dart: context-menu entries for cards.
-List<PopupMenuEntry<String>> handoffMenuEntries() {
-  if (!HandoffActions.available) return <PopupMenuEntry<String>>[];
-  return <PopupMenuEntry<String>>[
+List<_MenuEntry> handoffMenuEntries() {
+  if (!HandoffActions.available) return <_MenuEntry>[];
+  return <_MenuEntry>[
     PopupMenuItem<String>(
       value: 'send_to_pc',
       child: ListTile(
@@ -789,6 +850,19 @@ class _HandoffQrDialogState extends State<HandoffQrDialog> {
                       ),
           ),
           actions: [
+            if (!paired && c.serverRunning)
+              TextButton(
+                onPressed: () async {
+                  final text = await _payload;
+                  await Clipboard.setData(ClipboardData(text: text));
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Pairing code copied')),
+                    );
+                  }
+                },
+                child: const Text('Copy code'),
+              ),
             if (!paired && c.serverRunning) TextButton(onPressed: _refresh, child: const Text('New code')),
             TextButton(onPressed: () => Navigator.pop(context), child: Text(paired ? 'Done' : 'Close')),
           ],
@@ -807,22 +881,43 @@ class HandoffScanPage extends StatefulWidget {
 }
 
 class _HandoffScanPageState extends State<HandoffScanPage> {
+  final MobileScannerController _controller = MobileScannerController(
+    formats: const [BarcodeFormat.qrCode],
+  );
   bool _done = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Scan pairing QR')),
-      body: SimpleBarcodeScanner(
-        onBarcodeViewCreated: (controller) {},
-        onScanned: (res) {
+      body: MobileScanner(
+        controller: _controller,
+        onDetect: (capture) {
           if (_done) return;
-          // simple_barcode_scanner returns '-1' when the user cancels or closes it
-          if (res.isNotEmpty && res != '-1') {
-            _done = true;
-            Navigator.pop(context, res);
+          for (final b in capture.barcodes) {
+            final v = b.rawValue;
+            if (v != null && v.isNotEmpty) {
+              _done = true;
+              Navigator.pop(context, v);
+              break;
+            }
           }
         },
+        errorBuilder: (context, error) => Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(
+              'Camera error: ${error.errorCode.name}\n${error.errorDetails?.message ?? ''}',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
       ),
     );
   }
